@@ -6,7 +6,9 @@ export type AppStatus =
   | 'transcribing'
   | 'refining'
   | 'done'
-  | 'error';
+  | 'error'
+  | 'generating_quiz'
+  | 'quiz_only';
 
 interface StatusStepperProps {
   status: AppStatus;
