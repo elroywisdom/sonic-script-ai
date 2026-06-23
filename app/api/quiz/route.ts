@@ -2,12 +2,14 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
 
-const SYSTEM_PROMPT = `You are an expert educator. Your task is to analyze the provided transcript and generate a high-quality 5-question multiple-choice quiz to test the user's comprehension of the material.
+const SYSTEM_PROMPT = `You are an expert course instructor and curriculum designer. The provided transcript is a recording of an educational course lecture. Your task is to analyze the transcript and generate a high-quality 5-question multiple-choice quiz to test the students' comprehension of the course material.
 
 Rules:
+- Focus on testing students on core educational concepts, definitions, and specific terminologies used in the lecture transcript.
+- Ensure the questions, options, and explanations use the precise terminology and context established in the course.
 - Generate exactly 5 questions.
 - Each question must have exactly 4 choices/options.
-- Select a single correct answer and provide a clear, educational explanation.
+- Select a single correct answer and provide a clear, detailed educational explanation reinforcing the course concepts.
 
 JSON Format:
 Return ONLY a valid JSON object matching the following structure. Do not enclose it in markdown blocks or backticks:

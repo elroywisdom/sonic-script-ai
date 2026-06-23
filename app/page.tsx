@@ -4,10 +4,12 @@ import { useCallback, useRef, useState } from 'react';
 import StatusStepper, { type AppStatus } from '@/components/StatusStepper';
 import TranscriptWorkspace from '@/components/TranscriptWorkspace';
 import UploadZone from '@/components/UploadZone';
+import PasteTranscriptZone from '@/components/PasteTranscriptZone';
+import QuizWorkspace, { type Question } from '@/components/QuizWorkspace';
 import ProcessLogs, { type LogEntry } from '@/components/ProcessLogs';
 import { extractAudioChunks } from '@/lib/extractAudio';
 
-type PipelineStep = 'extracting' | 'transcribing' | 'refining';
+type PipelineStep = 'extracting' | 'transcribing' | 'refining' | 'generating_quiz';
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -30,13 +32,17 @@ export default function Home() {
   const [rawTranscript, setRawTranscript] = useState('');
   const [polishedTranscript, setPolishedTranscript] = useState('');
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [activeTab, setActiveTab] = useState<'video' | 'text'>('video');
+  const [pastedTranscript, setPastedTranscript] = useState('');
+  const [quizQuestions, setQuizQuestions] = useState<Question[]>([]);
   const currentFileRef = useRef<File | null>(null);
   const startTimeRef = useRef<number>(0);
 
   const isProcessing =
     status === 'extracting' ||
     status === 'transcribing' ||
-    status === 'refining';
+    status === 'refining' ||
+    status === 'generating_quiz';
 
   const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
     const elapsedSecs = (Date.now() - startTimeRef.current) / 1000;
@@ -144,6 +150,43 @@ export default function Home() {
     }
   }, [addLog]);
 
+  const runQuizPipeline = useCallback(async (transcript: string) => {
+    setPastedTranscript(transcript);
+    setErrorMessage('');
+    setQuizQuestions([]);
+    setLogs([]);
+    startTimeRef.current = Date.now();
+
+    try {
+      setStatus('generating_quiz');
+      setFailedStep('generating_quiz');
+      addLog('Initializing quiz generation pipeline...', 'info');
+      addLog('Analyzing transcript content...', 'info');
+      addLog(`Sending transcript (${transcript.length} characters) to AI for quiz generation...`, 'info');
+
+      const res = await fetch('/api/quiz', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(getResponseError(data));
+      }
+
+      setQuizQuestions(data.questions);
+      addLog('Quiz generated successfully! Loaded 5 questions.', 'success');
+      setStatus('quiz_only');
+    } catch (error) {
+      const errMsg = getErrorMessage(error);
+      addLog(`Error during quiz generation: ${errMsg}`, 'error');
+      setFailedStep('generating_quiz');
+      setStatus('error');
+      setErrorMessage(errMsg);
+    }
+  }, [addLog]);
+
   const handleStart = useCallback(
     (file: File) => {
       runPipeline(file);
@@ -152,10 +195,12 @@ export default function Home() {
   );
 
   const handleRetry = useCallback(() => {
-    if (currentFileRef.current) {
+    if (activeTab === 'text') {
+      runQuizPipeline(pastedTranscript);
+    } else if (currentFileRef.current) {
       runPipeline(currentFileRef.current);
     }
-  }, [runPipeline]);
+  }, [activeTab, pastedTranscript, runPipeline, runQuizPipeline]);
 
   const handleReset = useCallback(() => {
     currentFileRef.current = null;
@@ -164,6 +209,8 @@ export default function Home() {
     setFailedStep('extracting');
     setRawTranscript('');
     setPolishedTranscript('');
+    setPastedTranscript('');
+    setQuizQuestions([]);
     setLogs([]);
   }, []);
 
@@ -187,19 +234,97 @@ export default function Home() {
 
       <div className="flex-1 flex flex-col items-center px-6 py-12 gap-8 w-full max-w-4xl mx-auto">
         {status === 'idle' && (
-          <UploadZone onStart={handleStart} disabled={isProcessing} />
+          <div className="w-full max-w-2xl mx-auto space-y-6">
+            <div className="flex border-b border-white/10 w-full mb-2">
+              <button
+                onClick={() => setActiveTab('video')}
+                disabled={isProcessing}
+                className={`flex-1 py-3 text-center text-xs sm:text-sm font-semibold tracking-wider uppercase border-b-2 transition-all duration-300 ${
+                  activeTab === 'video'
+                    ? 'border-accent text-accent'
+                    : 'border-transparent text-muted-foreground hover:text-white'
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+              >
+                Upload Video
+              </button>
+              <button
+                onClick={() => setActiveTab('text')}
+                disabled={isProcessing}
+                className={`flex-1 py-3 text-center text-xs sm:text-sm font-semibold tracking-wider uppercase border-b-2 transition-all duration-300 ${
+                  activeTab === 'text'
+                    ? 'border-accent text-accent'
+                    : 'border-transparent text-muted-foreground hover:text-white'
+                } disabled:opacity-50 disabled:cursor-not-allowed`}
+              >
+                Paste Transcript
+              </button>
+            </div>
+
+            {activeTab === 'video' ? (
+              <UploadZone onStart={handleStart} disabled={isProcessing} />
+            ) : (
+              <PasteTranscriptZone onGenerate={runQuizPipeline} disabled={isProcessing} />
+            )}
+          </div>
         )}
 
-        {status !== 'idle' && status !== 'done' && (
+        {(status === 'extracting' || status === 'transcribing' || status === 'refining' || (status === 'error' && failedStep !== 'generating_quiz')) && (
           <>
             <StatusStepper
               status={status}
               errorMessage={errorMessage}
-              failedStep={failedStep}
+              failedStep={failedStep as 'extracting' | 'transcribing' | 'refining'}
               onRetry={handleRetry}
             />
             <ProcessLogs logs={logs} isProcessing={isProcessing} />
           </>
+        )}
+
+        {(status === 'generating_quiz' || (status === 'error' && failedStep === 'generating_quiz')) && (
+          <>
+            <div className="w-full max-w-3xl mx-auto bg-white/[0.01] border border-white/5 p-8 rounded-2xl backdrop-blur-xl shadow-[0_8px_30px_rgba(0,0,0,0.3)] flex flex-col items-center justify-center gap-6 animate-fade-in relative overflow-hidden">
+              <div className="absolute top-0 right-0 w-32 h-32 rounded-full bg-accent/5 blur-2xl pointer-events-none" />
+              
+              {status === 'generating_quiz' ? (
+                <div className="flex flex-col items-center justify-center gap-4 text-center">
+                  <div className="relative w-16 h-16 flex items-center justify-center">
+                    <span className="absolute inset-0 rounded-full border border-accent/20 animate-ping opacity-60" />
+                    <div className="w-12 h-12 rounded-full border-2 border-accent border-t-transparent animate-spin flex items-center justify-center shadow-[0_0_15px_rgba(0,212,180,0.2)]" />
+                  </div>
+                  <div className="space-y-1">
+                    <h3 className="text-lg font-semibold text-foreground">Generating Quiz Questions</h3>
+                    <p className="text-sm text-muted-foreground">AI is reading the transcript and formulating comprehension questions...</p>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex flex-col items-center justify-center gap-4 text-center w-full">
+                  <div className="w-12 h-12 rounded-full bg-red-500/10 text-red-400 border-2 border-red-500 flex items-center justify-center shadow-[0_0_15px_rgba(239,68,68,0.2)]">
+                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </div>
+                  <div className="space-y-1">
+                    <h3 className="text-lg font-semibold text-red-400">Quiz Generation Failed</h3>
+                    <p className="text-sm text-muted-foreground max-w-md mx-auto">{errorMessage || 'Something went wrong. Please try again.'}</p>
+                  </div>
+                  <button
+                    onClick={handleRetry}
+                    className="mt-2 px-6 py-2.5 rounded-lg text-xs font-semibold uppercase tracking-wider bg-red-500/10 text-red-300 border border-red-500/20 hover:bg-red-500/20 hover:text-white transition-all duration-200"
+                  >
+                    Try again
+                  </button>
+                </div>
+              )}
+            </div>
+            <ProcessLogs logs={logs} isProcessing={isProcessing} />
+          </>
+        )}
+
+        {status === 'quiz_only' && (
+          <QuizWorkspace
+            questions={quizQuestions}
+            onClose={handleReset}
+          />
         )}
 
         {status === 'done' && (

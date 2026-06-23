@@ -52,6 +52,51 @@ export default function QuizWorkspace({ questions, onClose }: QuizWorkspaceProps
     setQuizCompleted(false);
   };
 
+  const [copied, setCopied] = useState(false);
+
+  const generateMarkdown = () => {
+    let md = '# SonicScript AI - Comprehension Quiz\n\n';
+    questions.forEach((q, idx) => {
+      md += `### Question ${idx + 1}: ${q.question}\n\n`;
+      q.options.forEach((opt, oIdx) => {
+        const marker = oIdx === q.answerIndex ? '[x]' : '[ ]';
+        md += `- ${marker} ${opt}\n`;
+      });
+      md += `\n**Explanation:** ${q.explanation}\n\n`;
+      md += '---\n\n';
+    });
+    return md.trim();
+  };
+
+  const handleCopyMarkdown = async () => {
+    const mdContent = generateMarkdown();
+    try {
+      await navigator.clipboard.writeText(mdContent);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = mdContent;
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleDownloadMarkdown = () => {
+    const mdContent = generateMarkdown();
+    const blob = new Blob([mdContent], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `quiz-${Date.now()}.md`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   // Calculate score
   const correctCount = userAnswers.reduce((acc, ans, idx) => {
     return ans === questions[idx].answerIndex ? acc + 1 : acc;
@@ -185,6 +230,28 @@ export default function QuizWorkspace({ questions, onClose }: QuizWorkspaceProps
             Retake Quiz
           </button>
           <button
+            onClick={handleCopyMarkdown}
+            className="
+              px-6 py-2.5 rounded-lg text-sm font-medium
+              border border-white/10 text-muted-foreground bg-white/[0.01]
+              hover:border-accent hover:text-accent hover:bg-accent/5
+              transition-all duration-200 active:scale-95
+            "
+          >
+            {copied ? 'Copied ✓' : 'Copy Quiz (.md)'}
+          </button>
+          <button
+            onClick={handleDownloadMarkdown}
+            className="
+              px-6 py-2.5 rounded-lg text-sm font-medium
+              border border-white/10 text-muted-foreground bg-white/[0.01]
+              hover:border-accent hover:text-accent hover:bg-accent/5
+              transition-all duration-200 active:scale-95
+            "
+          >
+            Download Quiz (.md)
+          </button>
+          <button
             onClick={onClose}
             className="
               px-6 py-2.5 rounded-lg text-sm font-semibold text-background
@@ -206,11 +273,26 @@ export default function QuizWorkspace({ questions, onClose }: QuizWorkspaceProps
 
       {/* Progress header */}
       <div className="space-y-3 relative z-10">
-        <div className="flex justify-between items-center text-xs font-mono text-muted-foreground">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs font-mono text-muted-foreground border-b border-white/5 pb-3">
           <span className="tracking-wider">COMPREHENSION CHECK</span>
-          <span className="text-accent font-semibold">
-            Question {currentIdx + 1} of {questions.length}
-          </span>
+          <div className="flex items-center gap-3 flex-wrap">
+            <button
+              onClick={handleCopyMarkdown}
+              className="hover:text-accent text-white/50 transition-colors bg-white/5 hover:bg-white/10 px-2.5 py-1 rounded text-[10px]"
+            >
+              {copied ? 'Copied ✓' : 'Copy Quiz (.md)'}
+            </button>
+            <button
+              onClick={handleDownloadMarkdown}
+              className="hover:text-accent text-white/50 transition-colors bg-white/5 hover:bg-white/10 px-2.5 py-1 rounded text-[10px]"
+            >
+              Download Quiz (.md)
+            </button>
+            <span className="text-white/10 hidden sm:inline">|</span>
+            <span className="text-accent font-semibold">
+              Question {currentIdx + 1} of {questions.length}
+            </span>
+          </div>
         </div>
         {/* Progress Bar */}
         <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
