@@ -23,14 +23,47 @@ Return ONLY a valid JSON object matching the following structure. Do not enclose
   ]
 }`;
 
+async function generateWithGroq(transcript: string, apiKey: string) {
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: `Here is the transcript:\n\n${transcript}` },
+      ],
+      temperature: 0.5,
+      response_format: { type: 'json_object' }
+    }),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    throw new Error(`Groq API returned error: ${errorBody}`);
+  }
+
+  const data = await response.json();
+  let content = data.choices?.[0]?.message?.content?.trim() || '';
+  if (content.startsWith('```')) {
+    content = content.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+  }
+  return JSON.parse(content.trim());
+}
+
 export async function POST(request: NextRequest) {
   try {
-    const apiKey = process.env.DEEPSEEK_API_KEY;
-    if (!apiKey) {
+    const deepseekKey = process.env.DEEPSEEK_API_KEY;
+    const groqKey = process.env.GROQ_API_KEY;
+
+    if (!deepseekKey && !groqKey) {
       return NextResponse.json(
         {
           error: 'Quiz generation failed',
-          detail: 'DEEPSEEK_API_KEY is not configured',
+          detail: 'No API keys configured. Configure DEEPSEEK_API_KEY or GROQ_API_KEY.',
         },
         { status: 500 }
       );
@@ -46,47 +79,69 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: 'deepseek-chat',
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: `Here is the transcript:\n\n${transcript}` },
-        ],
-        temperature: 0.5,
-        response_format: { type: 'json_object' }
-      }),
-    });
+    let quizData = null;
 
-    if (!response.ok) {
-      const errorBody = await response.text();
-      console.error('DeepSeek quiz generation error:', errorBody);
-      let detail = 'Unknown error from DeepSeek API';
+    if (deepseekKey) {
+      console.log('Attempting quiz generation with DeepSeek...');
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000); // 10-second timeout for DeepSeek
+
       try {
-        const parsed = JSON.parse(errorBody);
-        detail = parsed.error?.message || parsed.message || detail;
-      } catch {
-        detail = errorBody || detail;
+        const response = await fetch('https://api.deepseek.com/v1/chat/completions', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${deepseekKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: 'deepseek-chat',
+            messages: [
+              { role: 'system', content: SYSTEM_PROMPT },
+              { role: 'user', content: `Here is the transcript:\n\n${transcript}` },
+            ],
+            temperature: 0.5,
+            response_format: { type: 'json_object' }
+          }),
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          const data = await response.json();
+          let content = data.choices?.[0]?.message?.content?.trim() || '';
+          if (content.startsWith('```')) {
+            content = content.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+          }
+          quizData = JSON.parse(content.trim());
+          console.log('Successfully generated quiz with DeepSeek.');
+        } else {
+          const errorBody = await response.text();
+          console.warn(`DeepSeek API failed with status ${response.status}: ${errorBody}`);
+        }
+      } catch (deepseekError) {
+        clearTimeout(timeoutId);
+        console.warn('DeepSeek quiz generation failed or timed out:', deepseekError);
       }
-      throw new Error(detail);
     }
 
-    const data = await response.json();
-    let content = data.choices?.[0]?.message?.content?.trim() || '';
-
-    // Handle potential LLM code block wrappers defensively
-    if (content.startsWith('```')) {
-      content = content.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+    // Fallback to Groq if DeepSeek failed or wasn't configured
+    if (!quizData) {
+      if (groqKey) {
+        console.log('Falling back to Groq Llama-3.3-70b-versatile for quiz generation...');
+        try {
+          quizData = await generateWithGroq(transcript, groqKey);
+          console.log('Successfully generated quiz with Groq.');
+        } catch (groqError) {
+          console.error('Groq fallback quiz generation failed:', groqError);
+          throw groqError;
+        }
+      } else {
+        throw new Error('DeepSeek failed to respond and no GROQ_API_KEY is configured for fallback.');
+      }
     }
-    content = content.trim();
 
-    // Parse to ensure valid JSON structure
-    const quizData = JSON.parse(content);
+    // Final structure validation
     if (!quizData.questions || !Array.isArray(quizData.questions) || quizData.questions.length === 0) {
       throw new Error('Invalid JSON format returned: questions array is missing or empty.');
     }
@@ -105,3 +160,4 @@ export async function POST(request: NextRequest) {
     );
   }
 }
+
