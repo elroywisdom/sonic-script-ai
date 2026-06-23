@@ -1,6 +1,6 @@
 const TARGET_SAMPLE_RATE = 16000;
-const GROQ_MAX_BYTES = 24 * 1024 * 1024; // stay under Groq's 25MB cap
-const CHUNK_DURATION_SECONDS = 600; // 10-minute segments for very long videos
+const GROQ_MAX_BYTES = 4 * 1024 * 1024; // 4MB limit to stay under Vercel's 4.5MB serverless payload limit
+const CHUNK_DURATION_SECONDS = 120; // 2-minute segments (approx 3.66MB at 16kHz mono 16-bit PCM)
 
 export interface ExtractedAudio {
   blob: Blob;
@@ -180,12 +180,12 @@ export async function extractAudioChunks(
     const encoded = await encodeAudio(resampledBuffer, onLog);
 
     if (encoded.blob.size <= GROQ_MAX_BYTES) {
-      onLog?.(`Audio size (${(encoded.blob.size / (1024 * 1024)).toFixed(2)} MB) is below 24MB limit. No chunking needed.`);
+      onLog?.(`Audio size (${(encoded.blob.size / (1024 * 1024)).toFixed(2)} MB) is below 4MB limit. No chunking needed.`);
       return [{ ...encoded, durationSeconds: resampledBuffer.duration }];
     }
 
     const chunkCount = Math.ceil(resampledBuffer.duration / CHUNK_DURATION_SECONDS);
-    onLog?.(`Audio size (${(encoded.blob.size / (1024 * 1024)).toFixed(2)} MB) exceeds 24MB limit. Chunking into ${chunkCount} parts (~${CHUNK_DURATION_SECONDS / 60}m each)...`);
+    onLog?.(`Audio size (${(encoded.blob.size / (1024 * 1024)).toFixed(2)} MB) exceeds 4MB limit. Chunking into ${chunkCount} parts (~${CHUNK_DURATION_SECONDS / 60}m each)...`);
     
     const chunks: ExtractedAudio[] = [];
     const totalDuration = resampledBuffer.duration;
