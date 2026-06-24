@@ -4,11 +4,13 @@ import { useState, useCallback, useEffect } from 'react';
 
 interface PasteTranscriptZoneProps {
   onGenerate: (transcript: string) => void;
+  onGenerateCaptions: (transcript: string) => void;
   disabled?: boolean;
 }
 
 export default function PasteTranscriptZone({
   onGenerate,
+  onGenerateCaptions,
   disabled = false,
 }: PasteTranscriptZoneProps) {
   const [text, setText] = useState('');
@@ -28,6 +30,12 @@ export default function PasteTranscriptZone({
       onGenerate(text.trim());
     }
   }, [text, disabled, onGenerate]);
+
+  const handleGenerateCaptions = useCallback(() => {
+    if (text.trim().length >= 50 && !disabled) {
+      onGenerateCaptions(text.trim());
+    }
+  }, [text, disabled, onGenerateCaptions]);
 
   const isTooShort = text.trim().length > 0 && text.trim().length < 50;
 
@@ -76,18 +84,30 @@ export default function PasteTranscriptZone({
           </p>
         )}
 
-        <div className="flex justify-center mt-2">
+        <div className="flex flex-col sm:flex-row justify-center items-center gap-4 mt-2">
           <button
             onClick={handleGenerate}
             disabled={disabled || text.trim().length < 50}
             className="
-              px-8 py-3 rounded-lg font-semibold text-background
+              w-full sm:w-auto px-8 py-3 rounded-lg font-semibold text-background
               bg-accent hover:bg-accent/90 hover:shadow-[0_0_20px_rgba(0,212,180,0.4)]
               active:scale-95 transition-all duration-200
               disabled:opacity-50 disabled:cursor-not-allowed
             "
           >
             Generate Quiz
+          </button>
+          <button
+            onClick={handleGenerateCaptions}
+            disabled={disabled || text.trim().length < 50}
+            className="
+              w-full sm:w-auto px-8 py-3 rounded-lg font-semibold text-white
+              bg-transparent border border-white/10 hover:border-accent hover:text-accent hover:bg-accent/5
+              active:scale-95 transition-all duration-200
+              disabled:opacity-50 disabled:cursor-not-allowed
+            "
+          >
+            Generate Social Captions
           </button>
         </div>
       </div>

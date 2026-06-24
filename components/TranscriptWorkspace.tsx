@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import QuizWorkspace, { type Question } from './QuizWorkspace';
+import CaptionWorkspace, { type CaptionData } from './CaptionWorkspace';
 
 interface TranscriptWorkspaceProps {
   rawTranscript: string;
@@ -18,6 +19,9 @@ export default function TranscriptWorkspace({
   const [quizState, setQuizState] = useState<'none' | 'loading' | 'loaded' | 'error'>('none');
   const [quizData, setQuizData] = useState<Question[]>([]);
   const [quizError, setQuizError] = useState('');
+  const [captionsState, setCaptionsState] = useState<'none' | 'loading' | 'loaded' | 'error'>('none');
+  const [captionsData, setCaptionsData] = useState<CaptionData | null>(null);
+  const [captionsError, setCaptionsError] = useState('');
 
   const countWords = (text: string) => text.split(/\s+/).filter(Boolean).length;
   const countChars = (text: string) => text.length;
@@ -69,6 +73,28 @@ export default function TranscriptWorkspace({
       console.error(err);
       setQuizError(err instanceof Error ? err.message : 'An error occurred during quiz generation');
       setQuizState('error');
+    }
+  };
+
+  const generateCaptions = async () => {
+    setCaptionsState('loading');
+    setCaptionsError('');
+    try {
+      const res = await fetch('/api/captions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript: polishedTranscript }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || data.error || 'Failed to generate captions');
+      }
+      setCaptionsData(data);
+      setCaptionsState('loaded');
+    } catch (err) {
+      console.error(err);
+      setCaptionsError(err instanceof Error ? err.message : 'An error occurred during captions generation');
+      setCaptionsState('error');
     }
   };
 
@@ -171,6 +197,20 @@ export default function TranscriptWorkspace({
         </div>
       )}
 
+      {/* Captions Section */}
+      {captionsState === 'loaded' && captionsData && (
+        <CaptionWorkspace
+          data={captionsData}
+          onClose={() => setCaptionsState('none')}
+        />
+      )}
+
+      {captionsState === 'error' && (
+        <div className="p-4 rounded-xl bg-red-500/[0.03] border border-red-500/10 text-center max-w-xl mx-auto animate-slide-down">
+          <p className="text-red-400 text-sm font-medium">{captionsError}</p>
+        </div>
+      )}
+
       {/* Actions */}
       <div className="mt-8 flex justify-center gap-4 flex-wrap">
         <button
@@ -197,6 +237,21 @@ export default function TranscriptWorkspace({
             "
           >
             {quizState === 'loading' ? 'Generating Quiz...' : 'Generate 5-Question Quiz'}
+          </button>
+        )}
+
+        {captionsState !== 'loaded' && (
+          <button
+            onClick={generateCaptions}
+            disabled={captionsState === 'loading'}
+            className="
+              px-6 py-2.5 rounded-lg text-sm font-semibold text-white
+              bg-transparent border border-white/10 hover:border-accent hover:text-accent hover:bg-accent/5
+              disabled:opacity-50 disabled:cursor-not-allowed
+              transition-all duration-200 active:scale-95
+            "
+          >
+            {captionsState === 'loading' ? 'Generating Captions...' : 'Generate Social Captions'}
           </button>
         )}
       </div>

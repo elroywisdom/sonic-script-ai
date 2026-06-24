@@ -8,7 +8,9 @@ export type AppStatus =
   | 'done'
   | 'error'
   | 'generating_quiz'
-  | 'quiz_only';
+  | 'quiz_only'
+  | 'generating_captions'
+  | 'captions_only';
 
 interface StatusStepperProps {
   status: AppStatus;

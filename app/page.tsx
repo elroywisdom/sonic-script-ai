@@ -6,10 +6,11 @@ import TranscriptWorkspace from '@/components/TranscriptWorkspace';
 import UploadZone from '@/components/UploadZone';
 import PasteTranscriptZone from '@/components/PasteTranscriptZone';
 import QuizWorkspace, { type Question } from '@/components/QuizWorkspace';
+import CaptionWorkspace, { type CaptionData } from '@/components/CaptionWorkspace';
 import ProcessLogs, { type LogEntry } from '@/components/ProcessLogs';
 import { extractAudioChunks } from '@/lib/extractAudio';
 
-type PipelineStep = 'extracting' | 'transcribing' | 'refining' | 'generating_quiz';
+type PipelineStep = 'extracting' | 'transcribing' | 'refining' | 'generating_quiz' | 'generating_captions';
 
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -35,6 +36,7 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<'video' | 'text'>('video');
   const [pastedTranscript, setPastedTranscript] = useState('');
   const [quizQuestions, setQuizQuestions] = useState<Question[]>([]);
+  const [captionsData, setCaptionsData] = useState<CaptionData | null>(null);
   const currentFileRef = useRef<File | null>(null);
   const startTimeRef = useRef<number>(0);
 
@@ -42,7 +44,8 @@ export default function Home() {
     status === 'extracting' ||
     status === 'transcribing' ||
     status === 'refining' ||
-    status === 'generating_quiz';
+    status === 'generating_quiz' ||
+    status === 'generating_captions';
 
   const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
     const elapsedSecs = (Date.now() - startTimeRef.current) / 1000;
@@ -187,6 +190,43 @@ export default function Home() {
     }
   }, [addLog]);
 
+  const runCaptionsPipeline = useCallback(async (transcript: string) => {
+    setPastedTranscript(transcript);
+    setErrorMessage('');
+    setCaptionsData(null);
+    setLogs([]);
+    startTimeRef.current = Date.now();
+
+    try {
+      setStatus('generating_captions');
+      setFailedStep('generating_captions');
+      addLog('Initializing caption generation pipeline...', 'info');
+      addLog('Analyzing transcript content for platform optimization...', 'info');
+      addLog(`Sending transcript (${transcript.length} characters) to AI for captions...`, 'info');
+
+      const res = await fetch('/api/captions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transcript }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(getResponseError(data));
+      }
+
+      setCaptionsData(data);
+      addLog('Social media captions generated successfully!', 'success');
+      setStatus('captions_only');
+    } catch (error) {
+      const errMsg = getErrorMessage(error);
+      addLog(`Error during captions generation: ${errMsg}`, 'error');
+      setFailedStep('generating_captions');
+      setStatus('error');
+      setErrorMessage(errMsg);
+    }
+  }, [addLog]);
+
   const handleStart = useCallback(
     (file: File) => {
       runPipeline(file);
@@ -196,11 +236,15 @@ export default function Home() {
 
   const handleRetry = useCallback(() => {
     if (activeTab === 'text') {
-      runQuizPipeline(pastedTranscript);
+      if (failedStep === 'generating_quiz') {
+        runQuizPipeline(pastedTranscript);
+      } else if (failedStep === 'generating_captions') {
+        runCaptionsPipeline(pastedTranscript);
+      }
     } else if (currentFileRef.current) {
       runPipeline(currentFileRef.current);
     }
-  }, [activeTab, pastedTranscript, runPipeline, runQuizPipeline]);
+  }, [activeTab, pastedTranscript, runPipeline, runQuizPipeline, runCaptionsPipeline, failedStep]);
 
   const handleReset = useCallback(() => {
     currentFileRef.current = null;
@@ -211,6 +255,7 @@ export default function Home() {
     setPolishedTranscript('');
     setPastedTranscript('');
     setQuizQuestions([]);
+    setCaptionsData(null);
     setLogs([]);
   }, []);
 
@@ -263,7 +308,11 @@ export default function Home() {
             {activeTab === 'video' ? (
               <UploadZone onStart={handleStart} disabled={isProcessing} />
             ) : (
-              <PasteTranscriptZone onGenerate={runQuizPipeline} disabled={isProcessing} />
+              <PasteTranscriptZone
+                onGenerate={runQuizPipeline}
+                onGenerateCaptions={runCaptionsPipeline}
+                disabled={isProcessing}
+              />
             )}
           </div>
         )}
@@ -280,20 +329,26 @@ export default function Home() {
           </>
         )}
 
-        {(status === 'generating_quiz' || (status === 'error' && failedStep === 'generating_quiz')) && (
+        {(status === 'generating_quiz' || status === 'generating_captions' || (status === 'error' && (failedStep === 'generating_quiz' || failedStep === 'generating_captions'))) && (
           <>
             <div className="w-full max-w-3xl mx-auto bg-white/[0.01] border border-white/5 p-8 rounded-2xl backdrop-blur-xl shadow-[0_8px_30px_rgba(0,0,0,0.3)] flex flex-col items-center justify-center gap-6 animate-fade-in relative overflow-hidden">
               <div className="absolute top-0 right-0 w-32 h-32 rounded-full bg-accent/5 blur-2xl pointer-events-none" />
               
-              {status === 'generating_quiz' ? (
+              {status === 'generating_quiz' || status === 'generating_captions' ? (
                 <div className="flex flex-col items-center justify-center gap-4 text-center">
                   <div className="relative w-16 h-16 flex items-center justify-center">
                     <span className="absolute inset-0 rounded-full border border-accent/20 animate-ping opacity-60" />
                     <div className="w-12 h-12 rounded-full border-2 border-accent border-t-transparent animate-spin flex items-center justify-center shadow-[0_0_15px_rgba(0,212,180,0.2)]" />
                   </div>
                   <div className="space-y-1">
-                    <h3 className="text-lg font-semibold text-foreground">Generating Quiz Questions</h3>
-                    <p className="text-sm text-muted-foreground">AI is reading the transcript and formulating comprehension questions...</p>
+                    <h3 className="text-lg font-semibold text-foreground">
+                      {status === 'generating_quiz' ? 'Generating Quiz Questions' : 'Generating Social Captions'}
+                    </h3>
+                    <p className="text-sm text-muted-foreground">
+                      {status === 'generating_quiz' 
+                        ? 'AI is reading the transcript and formulating comprehension questions...' 
+                        : 'AI is reading the transcript and crafting optimized social media posts...'}
+                    </p>
                   </div>
                 </div>
               ) : (
@@ -304,7 +359,9 @@ export default function Home() {
                     </svg>
                   </div>
                   <div className="space-y-1">
-                    <h3 className="text-lg font-semibold text-red-400">Quiz Generation Failed</h3>
+                    <h3 className="text-lg font-semibold text-red-400">
+                      {failedStep === 'generating_quiz' ? 'Quiz Generation Failed' : 'Captions Generation Failed'}
+                    </h3>
                     <p className="text-sm text-muted-foreground max-w-md mx-auto">{errorMessage || 'Something went wrong. Please try again.'}</p>
                   </div>
                   <button
@@ -323,6 +380,13 @@ export default function Home() {
         {status === 'quiz_only' && (
           <QuizWorkspace
             questions={quizQuestions}
+            onClose={handleReset}
+          />
+        )}
+
+        {status === 'captions_only' && captionsData && (
+          <CaptionWorkspace
+            data={captionsData}
             onClose={handleReset}
           />
         )}
