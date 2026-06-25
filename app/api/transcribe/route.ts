@@ -9,6 +9,8 @@ export async function POST(request: NextRequest) {
     const audio = formData.get('audio');
     const filename = (formData.get('filename') as string) || 'audio.webm';
 
+    const offset = Number(formData.get('offset') || '0');
+
     if (!audio || !(audio instanceof Blob)) {
       return NextResponse.json(
         { error: 'Transcription failed', detail: 'No audio file provided' },
@@ -16,7 +18,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const rawTranscript = await transcribeWithGroq(audio, filename);
+    const rawTranscript = await transcribeWithGroq(audio, filename, offset);
     return NextResponse.json({ rawTranscript });
   } catch (error) {
     console.error('Transcription route error:', error);

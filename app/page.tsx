@@ -84,6 +84,7 @@ export default function Home() {
         const transcribeForm = new FormData();
         transcribeForm.append('audio', audioChunks[0].blob, audioChunks[0].filename);
         transcribeForm.append('filename', audioChunks[0].filename);
+        transcribeForm.append('offset', '0');
 
         const res = await fetch('/api/transcribe', {
           method: 'POST',
@@ -103,6 +104,8 @@ export default function Home() {
           const transcribeForm = new FormData();
           transcribeForm.append('audio', chunk.blob, chunk.filename);
           transcribeForm.append('filename', chunk.filename);
+          const chunkOffset = i * 120; // 120 seconds (2 minutes) per chunk
+          transcribeForm.append('offset', String(chunkOffset));
 
           const res = await fetch('/api/transcribe', {
             method: 'POST',

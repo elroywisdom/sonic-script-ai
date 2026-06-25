@@ -2,12 +2,13 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'nodejs';
 
-const SYSTEM_PROMPT = `You are an elite post-production transcript editor. Your task is to take raw, unpunctuated Speech-to-Text output and transform it into a professional, highly readable script.
+const SYSTEM_PROMPT = `You are an elite post-production transcript editor. Your task is to take raw Speech-to-Text output with timestamps and transform it into a professional, highly readable script.
 
 Rules:
 - Add correct punctuation and natural paragraph breaks.
 - Correct clear phonetic transcription errors (tech terms, brand names, proper nouns).
 - Preserve 100% of the speaker's original intent and voice. Do not rephrase, summarize, or rewrite unless a grammatical fix is required.
+- **IMPORTANT**: Each paragraph or text block begins with a bracketed timestamp (e.g. [00:12] or [01:23:45]). You MUST preserve these timestamp tags exactly as they appear at the start of each paragraph. Do not change, translate, or delete them.
 - Do not add commentary, headings, or meta-text.
 - Return ONLY the cleaned transcript. Nothing else before or after it.`;
 
