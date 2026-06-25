@@ -272,7 +272,8 @@ export default function Home() {
           </h1>
           <p className="mt-2 text-sm text-muted-foreground max-w-2xl leading-relaxed">
             Instantly transform video recordings into polished, shareable transcripts,
-            formatted markdown documentation, and interactive comprehension quizzes.
+            formatted markdown documentation, interactive comprehension quizzes, and
+            optimized social media captions.
           </p>
         </div>
       </header>
