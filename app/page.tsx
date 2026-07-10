@@ -97,8 +97,11 @@ export default function Home() {
         raw = transcribeData.rawTranscript;
         addLog('Transcription completed successfully.', 'success');
       } else {
-        addLog(`Starting concurrent transcription of ${audioChunks.length} chunks...`, 'info');
-        const promises = audioChunks.map(async (chunk, i) => {
+        addLog(`Starting sequential transcription of ${audioChunks.length} chunks to prevent rate limits and timeouts...`, 'info');
+        const transcripts: string[] = [];
+        
+        for (let i = 0; i < audioChunks.length; i++) {
+          const chunk = audioChunks[i];
           addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading '${chunk.filename}' (${(chunk.blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
 
           const transcribeForm = new FormData();
@@ -118,10 +121,14 @@ export default function Home() {
           }
 
           addLog(`[Chunk ${i + 1}/${audioChunks.length}] Transcribed successfully.`, 'success');
-          return transcribeData.rawTranscript;
-        });
+          transcripts.push(transcribeData.rawTranscript);
 
-        const transcripts = await Promise.all(promises);
+          // Add a short delay between requests to be gentle on the API
+          if (i < audioChunks.length - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        }
+
         raw = transcripts.join(' ').trim();
         addLog('All audio chunks transcribed successfully.', 'success');
       }
