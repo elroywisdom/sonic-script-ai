@@ -128,19 +128,134 @@ function sliceAudioBuffer(
   return slice;
 }
 
+async function extractAudioFromVideoElement(
+  videoFile: File,
+  onLog?: (msg: string) => void
+): Promise<AudioBuffer> {
+  onLog?.('Creating media stream from video element...');
+  const videoUrl = URL.createObjectURL(videoFile);
+  const video = document.createElement('video');
+  video.src = videoUrl;
+  video.preload = 'auto';
+  video.crossOrigin = 'anonymous';
+  video.muted = false;
+  video.playsInline = true;
+
+  await new Promise<void>((resolve, reject) => {
+    video.onloadedmetadata = () => resolve();
+    video.onerror = () => reject(new Error('Failed to load video element metadata'));
+  });
+
+  const duration = video.duration || 0;
+  onLog?.(`Video element loaded. Duration: ${duration.toFixed(1)}s (${(duration / 60).toFixed(1)} minutes)`);
+
+  const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
+  const source = audioContext.createMediaElementSource(video);
+
+  const bufferSize = 4096;
+  const scriptProcessor = audioContext.createScriptProcessor(bufferSize, 2, 1);
+  const capturedChunks: Float32Array[] = [];
+
+  scriptProcessor.onaudioprocess = (e) => {
+    const inputBuffer = e.inputBuffer;
+    const channel0 = inputBuffer.getChannelData(0);
+    const chunk = new Float32Array(channel0.length);
+    chunk.set(channel0);
+    capturedChunks.push(chunk);
+  };
+
+  const silentGain = audioContext.createGain();
+  silentGain.gain.value = 0;
+
+  source.connect(scriptProcessor);
+  scriptProcessor.connect(silentGain);
+  silentGain.connect(audioContext.destination);
+
+  const PLAYBACK_RATE = 8.0;
+  video.playbackRate = PLAYBACK_RATE;
+  (video as HTMLVideoElement & { preservesPitch?: boolean }).preservesPitch = false;
+
+  onLog?.(`Streaming audio from video element at ${PLAYBACK_RATE}x speed...`);
+
+  await new Promise<void>((resolve, reject) => {
+    let lastLoggedPct = -1;
+    const interval = setInterval(() => {
+      if (video.duration > 0) {
+        const pct = Math.floor((video.currentTime / video.duration) * 100);
+        if (pct >= lastLoggedPct + 2) {
+          lastLoggedPct = pct;
+          onLog?.(`Extracting audio stream (${PLAYBACK_RATE}x speed): ${pct}% complete (${video.currentTime.toFixed(1)}s / ${video.duration.toFixed(1)}s)...`);
+        }
+      }
+      if (video.ended || video.currentTime >= video.duration) {
+        clearInterval(interval);
+        resolve();
+      }
+    }, 250);
+
+    video.onended = () => {
+      clearInterval(interval);
+      resolve();
+    };
+
+    video.onerror = (err) => {
+      clearInterval(interval);
+      reject(new Error(`Video playback error during extraction: ${err}`));
+    };
+
+    video.play().catch(reject);
+  });
+
+  onLog?.('Audio stream capture complete. Assembling AudioBuffer...');
+  video.pause();
+  source.disconnect();
+  scriptProcessor.disconnect();
+  silentGain.disconnect();
+  URL.revokeObjectURL(videoUrl);
+
+  const totalLength = capturedChunks.reduce((sum, c) => sum + c.length, 0);
+  const effectiveSampleRate = audioContext.sampleRate / PLAYBACK_RATE;
+  const resultBuffer = audioContext.createBuffer(1, Math.max(1, totalLength), effectiveSampleRate);
+  const channelData = resultBuffer.getChannelData(0);
+
+  let offset = 0;
+  for (const chunk of capturedChunks) {
+    channelData.set(chunk, offset);
+    offset += chunk.length;
+  }
+
+  await audioContext.close();
+  return resultBuffer;
+}
+
+async function getDecodedAudioBuffer(
+  videoFile: File,
+  audioContext: AudioContext,
+  onLog?: (msg: string) => void
+): Promise<AudioBuffer> {
+  try {
+    onLog?.('Loading video file buffer...');
+    const arrayBuffer = await videoFile.arrayBuffer();
+    onLog?.('Decoding audio data with Web Audio API...');
+    const decoded = await audioContext.decodeAudioData(arrayBuffer);
+    onLog?.(`Audio decoded successfully. Duration: ${decoded.duration.toFixed(1)}s, channels: ${decoded.numberOfChannels}, sample rate: ${decoded.sampleRate}Hz`);
+    return decoded;
+  } catch (err) {
+    onLog?.(`Web Audio decodeAudioData failed (${err instanceof Error ? err.message : String(err)}). Switching to HTML5 Video element fallback extractor...`);
+    return await extractAudioFromVideoElement(videoFile, onLog);
+  }
+}
+
 export async function extractAudio(
   videoFile: File,
   onLog?: (msg: string) => void
 ): Promise<ExtractedAudio> {
   onLog?.(`Loading video file: ${videoFile.name} (${(videoFile.size / (1024 * 1024)).toFixed(2)} MB)`);
-  const arrayBuffer = await videoFile.arrayBuffer();
   onLog?.('Initializing AudioContext...');
   const audioContext = new AudioContext();
 
   try {
-    onLog?.('Decoding audio data with Web Audio API...');
-    const decodedBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    onLog?.(`Audio decoded successfully. Duration: ${decodedBuffer.duration.toFixed(1)}s, channels: ${decodedBuffer.numberOfChannels}, sample rate: ${decodedBuffer.sampleRate}Hz`);
+    const decodedBuffer = await getDecodedAudioBuffer(videoFile, audioContext, onLog);
     
     onLog?.('Resampling audio to 16kHz mono...');
     const resampledBuffer = await resampleToMono16kHz(audioContext, decodedBuffer, onLog);
@@ -163,14 +278,11 @@ export async function extractAudioChunks(
   onLog?: (msg: string) => void
 ): Promise<ExtractedAudio[]> {
   onLog?.(`Loading video file: ${videoFile.name} (${(videoFile.size / (1024 * 1024)).toFixed(2)} MB)`);
-  const arrayBuffer = await videoFile.arrayBuffer();
   onLog?.('Initializing AudioContext...');
   const audioContext = new AudioContext();
 
   try {
-    onLog?.('Decoding audio data with Web Audio API...');
-    const decodedBuffer = await audioContext.decodeAudioData(arrayBuffer);
-    onLog?.(`Audio decoded successfully. Duration: ${decodedBuffer.duration.toFixed(1)}s, channels: ${decodedBuffer.numberOfChannels}, original sample rate: ${decodedBuffer.sampleRate}Hz`);
+    const decodedBuffer = await getDecodedAudioBuffer(videoFile, audioContext, onLog);
     
     onLog?.('Resampling audio to 16kHz mono...');
     const resampledBuffer = await resampleToMono16kHz(audioContext, decodedBuffer, onLog);
@@ -217,3 +329,4 @@ export async function extractAudioChunks(
     await audioContext.close();
   }
 }
+

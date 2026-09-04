@@ -8,7 +8,15 @@ import PasteTranscriptZone from '@/components/PasteTranscriptZone';
 import QuizWorkspace, { type Question } from '@/components/QuizWorkspace';
 import CaptionWorkspace, { type CaptionData } from '@/components/CaptionWorkspace';
 import ProcessLogs, { type LogEntry } from '@/components/ProcessLogs';
-import { extractAudioChunks } from '@/lib/extractAudio';
+import { extractAudioChunks, type ExtractedAudio } from '@/lib/extractAudio';
+
+import ProcessingDashboard from '@/components/ProcessingDashboard';
+import {
+  saveCachedChunks,
+  getCachedRecord,
+  saveChunkTranscript,
+  type CachedRecord,
+} from '@/lib/audioCache';
 
 type PipelineStep = 'extracting' | 'transcribing' | 'refining' | 'generating_quiz' | 'generating_captions';
 
@@ -26,6 +34,10 @@ function getResponseError(data: Record<string, unknown>): string {
   );
 }
 
+function getFileKey(file: File): string {
+  return `${file.name}_${file.size}_${file.lastModified}`;
+}
+
 export default function Home() {
   const [status, setStatus] = useState<AppStatus>('idle');
   const [errorMessage, setErrorMessage] = useState('');
@@ -37,6 +49,16 @@ export default function Home() {
   const [pastedTranscript, setPastedTranscript] = useState('');
   const [quizQuestions, setQuizQuestions] = useState<Question[]>([]);
   const [captionsData, setCaptionsData] = useState<CaptionData | null>(null);
+  
+  // Dashboard calculation states
+  const [progressPercent, setProgressPercent] = useState(0);
+  const [estimatedRemainingSeconds, setEstimatedRemainingSeconds] = useState(0);
+  const [totalDurationSeconds, setTotalDurationSeconds] = useState(0);
+  const [currentChunkIndex, setCurrentChunkIndex] = useState(1);
+  const [totalChunks, setTotalChunks] = useState(1);
+  const [cachedRecordFound, setCachedRecordFound] = useState<CachedRecord | null>(null);
+
+  const audioChunksRef = useRef<ExtractedAudio[]>([]);
   const currentFileRef = useRef<File | null>(null);
   const startTimeRef = useRef<number>(0);
 
@@ -55,28 +77,222 @@ export default function Home() {
     const ms = Math.floor((elapsedSecs % 1) * 10);
     const timestamp = `${pad(mins)}:${pad(secs)}.${ms}`;
 
+    // Parse progress percentages and duration metrics from log messages
+    if (message.includes('complete') && message.includes('%')) {
+      const match = message.match(/(\d+)%\s+complete/);
+      if (match) {
+        const extractPct = parseInt(match[1], 10);
+        // Extraction represents 0-50% of total pipeline
+        const overallPct = Math.round((extractPct / 100) * 50);
+        setProgressPercent(overallPct);
+      }
+    }
+    if (message.includes('Duration:')) {
+      const durMatch = message.match(/Duration:\s*([\d\.]+)s/);
+      if (durMatch) {
+        const durationSecs = parseFloat(durMatch[1]);
+        setTotalDurationSeconds(durationSecs);
+        // 8x speed extraction estimate (duration / 8) + buffer for transcription
+        const estSecs = Math.round(durationSecs / 8) + 60;
+        setEstimatedRemainingSeconds(estSecs);
+      }
+    }
+
     setLogs((prev) => [...prev, { timestamp, message, type }]);
   }, []);
 
   const runPipeline = useCallback(async (file: File) => {
     currentFileRef.current = file;
+    audioChunksRef.current = [];
     setErrorMessage('');
     setRawTranscript('');
     setPolishedTranscript('');
     setLogs([]);
+    setProgressPercent(0);
+    setEstimatedRemainingSeconds(120);
     startTimeRef.current = Date.now();
 
+    const fileKey = getFileKey(file);
     let currentStep: PipelineStep = 'extracting';
 
     try {
-      setStatus('extracting');
-      currentStep = 'extracting';
-      addLog(`Initializing extraction pipeline for ${file.name}...`, 'info');
-      const audioChunks = await extractAudioChunks(file, (msg) => addLog(msg, 'info'));
+      // Check IndexedDB cache first
+      const cached = await getCachedRecord(fileKey);
+      let audioChunks: ExtractedAudio[] = [];
+
+      if (cached && cached.chunks.length > 0) {
+        addLog(`Found cached audio extractions for '${file.name}' in browser storage (${cached.chunks.length} chunks). Skipping extraction phase!`, 'success');
+        audioChunks = cached.chunks;
+        audioChunksRef.current = audioChunks;
+        setTotalDurationSeconds(cached.durationSeconds || 0);
+        setProgressPercent(50);
+      } else {
+        setStatus('extracting');
+        currentStep = 'extracting';
+        addLog(`Initializing extraction pipeline for ${file.name}...`, 'info');
+        audioChunks = await extractAudioChunks(file, (msg) => addLog(msg, 'info'));
+        audioChunksRef.current = audioChunks;
+
+        const dur = audioChunks.reduce((acc, c) => acc + c.durationSeconds, 0);
+        setTotalDurationSeconds(dur);
+
+        // Save extracted chunks to IndexedDB
+        await saveCachedChunks(fileKey, file.name, file.size, dur, audioChunks);
+        addLog(`Saved extracted audio chunks to local browser storage.`, 'info');
+      }
 
       setStatus('transcribing');
       currentStep = 'transcribing';
+      setTotalChunks(audioChunks.length);
       addLog(`Extraction complete. Created ${audioChunks.length} audio chunk(s) for transcription.`, 'success');
+
+      let raw = '';
+      if (audioChunks.length === 1) {
+        setCurrentChunkIndex(1);
+        setProgressPercent(60);
+        addLog(`Uploading audio file '${audioChunks[0].filename}' (${(audioChunks[0].blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
+        const transcribeForm = new FormData();
+        transcribeForm.append('audio', audioChunks[0].blob, audioChunks[0].filename);
+        transcribeForm.append('filename', audioChunks[0].filename);
+        transcribeForm.append('offset', '0');
+
+        const res = await fetch('/api/transcribe', {
+          method: 'POST',
+          body: transcribeForm,
+        });
+        const contentType = res.headers.get('content-type') || '';
+        let transcribeData: Record<string, unknown> = {};
+        if (contentType.includes('application/json')) {
+          transcribeData = await res.json();
+        } else {
+          const errText = await res.text();
+          throw new Error(`Server returned non-JSON error (${res.status}): ${errText.slice(0, 200)}`);
+        }
+        if (!res.ok) {
+          throw new Error(getResponseError(transcribeData));
+        }
+        raw = transcribeData.rawTranscript as string;
+        await saveChunkTranscript(fileKey, 0, raw);
+        addLog('Transcription completed successfully.', 'success');
+        setProgressPercent(90);
+      } else {
+        addLog(`Starting sequential transcription of ${audioChunks.length} chunks to prevent rate limits and timeouts...`, 'info');
+        const transcripts: string[] = [];
+        const existingRecord = await getCachedRecord(fileKey);
+        const existingTranscripts = existingRecord?.transcripts || {};
+
+        for (let i = 0; i < audioChunks.length; i++) {
+          setCurrentChunkIndex(i + 1);
+          // Transcription represents 50% to 90% progress
+          const currentPct = 50 + Math.round(((i + 1) / audioChunks.length) * 40);
+          setProgressPercent(currentPct);
+          
+          const remChunkSecs = Math.max(5, (audioChunks.length - i) * 3);
+          setEstimatedRemainingSeconds(remChunkSecs);
+
+          if (existingTranscripts[i]) {
+            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Loaded from browser cache.`, 'success');
+            transcripts.push(existingTranscripts[i]);
+            continue;
+          }
+
+          const chunk = audioChunks[i];
+          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading '${chunk.filename}' (${(chunk.blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
+
+          const transcribeForm = new FormData();
+          transcribeForm.append('audio', chunk.blob, chunk.filename);
+          transcribeForm.append('filename', chunk.filename);
+          const chunkOffset = i * 120; // 120 seconds (2 minutes) per chunk
+          transcribeForm.append('offset', String(chunkOffset));
+
+          const res = await fetch('/api/transcribe', {
+            method: 'POST',
+            body: transcribeForm,
+          });
+          const contentType = res.headers.get('content-type') || '';
+          let transcribeData: Record<string, unknown> = {};
+          if (contentType.includes('application/json')) {
+            transcribeData = await res.json();
+          } else {
+            const errText = await res.text();
+            throw new Error(`Server returned non-JSON error (${res.status}): ${errText.slice(0, 200)}`);
+          }
+          if (!res.ok) {
+            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Failed: ${getResponseError(transcribeData)}`, 'error');
+            throw new Error(getResponseError(transcribeData));
+          }
+
+          const chunkText = transcribeData.rawTranscript as string;
+          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Transcribed successfully.`, 'success');
+          transcripts.push(chunkText);
+          await saveChunkTranscript(fileKey, i, chunkText);
+
+          if (i < audioChunks.length - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        }
+
+        raw = transcripts.join(' ').trim();
+        addLog('All audio chunks transcribed successfully.', 'success');
+      }
+
+      setRawTranscript(raw);
+
+      setStatus('refining');
+      currentStep = 'refining';
+      setProgressPercent(92);
+      setEstimatedRemainingSeconds(10);
+      addLog(`Sending raw transcript (${raw.length} characters) to DeepSeek-Chat for refining & polishing...`, 'info');
+      const refineRes = await fetch('/api/refine', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rawTranscript: raw }),
+      });
+
+      const refineContentType = refineRes.headers.get('content-type') || '';
+      let refineData: Record<string, unknown> = {};
+      if (refineContentType.includes('application/json')) {
+        refineData = await refineRes.json();
+      } else {
+        const errText = await refineRes.text();
+        throw new Error(`Refine server error (${refineRes.status}): ${errText.slice(0, 200)}`);
+      }
+      if (!refineRes.ok) {
+        throw new Error(getResponseError(refineData));
+      }
+
+      const polished = (refineData.polishedTranscript as string) || raw;
+      setPolishedTranscript(polished);
+      setProgressPercent(100);
+      setEstimatedRemainingSeconds(0);
+      addLog(`Polishing completed successfully (${polished.length} characters).`, 'success');
+      setStatus('done');
+      addLog('Pipeline completed successfully! Enjoy your transcript.', 'success');
+    } catch (error) {
+      const errMsg = getErrorMessage(error);
+      addLog(`Error during step '${currentStep}': ${errMsg}`, 'error');
+      setFailedStep(currentStep);
+      setStatus('error');
+      setErrorMessage(errMsg);
+    }
+  }, [addLog]);
+
+  const retryTranscriptionOnly = useCallback(async () => {
+    const audioChunks = audioChunksRef.current;
+    if (!audioChunks || audioChunks.length === 0) {
+      if (currentFileRef.current) {
+        runPipeline(currentFileRef.current);
+      }
+      return;
+    }
+
+    setErrorMessage('');
+    let currentStep: PipelineStep = 'transcribing';
+
+    try {
+      setStatus('transcribing');
+      currentStep = 'transcribing';
+      addLog(`Resuming transcription with ${audioChunks.length} cached audio chunk(s)...`, 'info');
 
       let raw = '';
       if (audioChunks.length === 1) {
@@ -90,11 +306,18 @@ export default function Home() {
           method: 'POST',
           body: transcribeForm,
         });
-        const transcribeData = await res.json();
+        const contentType = res.headers.get('content-type') || '';
+        let transcribeData: Record<string, unknown> = {};
+        if (contentType.includes('application/json')) {
+          transcribeData = await res.json();
+        } else {
+          const errText = await res.text();
+          throw new Error(`Server returned non-JSON error (${res.status}): ${errText.slice(0, 200)}`);
+        }
         if (!res.ok) {
           throw new Error(getResponseError(transcribeData));
         }
-        raw = transcribeData.rawTranscript;
+        raw = transcribeData.rawTranscript as string;
         addLog('Transcription completed successfully.', 'success');
       } else {
         addLog(`Starting sequential transcription of ${audioChunks.length} chunks to prevent rate limits and timeouts...`, 'info');
@@ -114,16 +337,22 @@ export default function Home() {
             method: 'POST',
             body: transcribeForm,
           });
-          const transcribeData = await res.json();
+          const contentType = res.headers.get('content-type') || '';
+          let transcribeData: Record<string, unknown> = {};
+          if (contentType.includes('application/json')) {
+            transcribeData = await res.json();
+          } else {
+            const errText = await res.text();
+            throw new Error(`Server returned non-JSON error (${res.status}): ${errText.slice(0, 200)}`);
+          }
           if (!res.ok) {
             addLog(`[Chunk ${i + 1}/${audioChunks.length}] Failed: ${getResponseError(transcribeData)}`, 'error');
             throw new Error(getResponseError(transcribeData));
           }
 
           addLog(`[Chunk ${i + 1}/${audioChunks.length}] Transcribed successfully.`, 'success');
-          transcripts.push(transcribeData.rawTranscript);
+          transcripts.push(transcribeData.rawTranscript as string);
 
-          // Add a short delay between requests to be gentle on the API
           if (i < audioChunks.length - 1) {
             await new Promise((resolve) => setTimeout(resolve, 500));
           }
@@ -144,12 +373,19 @@ export default function Home() {
         body: JSON.stringify({ rawTranscript: raw }),
       });
 
-      const refineData = await refineRes.json();
+      const refineContentType = refineRes.headers.get('content-type') || '';
+      let refineData: Record<string, unknown> = {};
+      if (refineContentType.includes('application/json')) {
+        refineData = await refineRes.json();
+      } else {
+        const errText = await refineRes.text();
+        throw new Error(`Refine server error (${refineRes.status}): ${errText.slice(0, 200)}`);
+      }
       if (!refineRes.ok) {
         throw new Error(getResponseError(refineData));
       }
 
-      const polished = refineData.polishedTranscript as string;
+      const polished = (refineData.polishedTranscript as string) || raw;
       setPolishedTranscript(polished);
       addLog(`Polishing completed successfully (${polished.length} characters).`, 'success');
       setStatus('done');
@@ -161,7 +397,7 @@ export default function Home() {
       setStatus('error');
       setErrorMessage(errMsg);
     }
-  }, [addLog]);
+  }, [addLog, runPipeline]);
 
   const runQuizPipeline = useCallback(async (transcript: string) => {
     setPastedTranscript(transcript);
@@ -251,10 +487,12 @@ export default function Home() {
       } else if (failedStep === 'generating_captions') {
         runCaptionsPipeline(pastedTranscript);
       }
+    } else if (failedStep === 'transcribing' && audioChunksRef.current.length > 0) {
+      retryTranscriptionOnly();
     } else if (currentFileRef.current) {
       runPipeline(currentFileRef.current);
     }
-  }, [activeTab, pastedTranscript, runPipeline, runQuizPipeline, runCaptionsPipeline, failedStep]);
+  }, [activeTab, pastedTranscript, runPipeline, retryTranscriptionOnly, runQuizPipeline, runCaptionsPipeline, failedStep]);
 
   const handleReset = useCallback(() => {
     currentFileRef.current = null;
@@ -328,7 +566,7 @@ export default function Home() {
           </div>
         )}
 
-        {(status === 'extracting' || status === 'transcribing' || status === 'refining' || (status === 'error' && failedStep !== 'generating_quiz')) && (
+        {(status === 'extracting' || status === 'transcribing' || status === 'refining' || (status === 'error' && failedStep !== 'generating_quiz' && failedStep !== 'generating_captions')) && (
           <>
             <StatusStepper
               status={status}
@@ -336,7 +574,17 @@ export default function Home() {
               failedStep={failedStep as 'extracting' | 'transcribing' | 'refining'}
               onRetry={handleRetry}
             />
-            <ProcessLogs logs={logs} isProcessing={isProcessing} />
+            <ProcessingDashboard
+              status={status}
+              logs={logs}
+              progressPercent={progressPercent}
+              estimatedRemainingSeconds={estimatedRemainingSeconds}
+              totalDurationSeconds={totalDurationSeconds}
+              currentChunkIndex={currentChunkIndex}
+              totalChunks={totalChunks}
+              onRetry={handleRetry}
+              errorMessage={errorMessage}
+            />
           </>
         )}
 
