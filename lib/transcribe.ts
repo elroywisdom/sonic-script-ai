@@ -103,12 +103,29 @@ export async function transcribeWithGroq(
 
   let output = '';
   let lastTimestampSecs = -999;
+  let lastText = '';
+  let repeatCount = 0;
   const TIMESTAMP_INTERVAL_SECS = 15;
 
   for (const segment of segments) {
     const absoluteStart = offset + segment.start;
     const text = segment.text.trim();
     if (!text) continue;
+
+    // Filter out repetitive single-word Whisper hallucinations on silent frames (e.g. "you", "Thank you.")
+    const normalized = text.toLowerCase().replace(/[^a-z]/g, '');
+    if (normalized === 'you' || normalized === 'thankyou' || normalized === 'subtitlesby') {
+      if (normalized === lastText) {
+        repeatCount++;
+        if (repeatCount > 2) continue; // Skip repetitive silent hallucinations
+      } else {
+        lastText = normalized;
+        repeatCount = 1;
+      }
+    } else {
+      lastText = normalized;
+      repeatCount = 0;
+    }
 
     if (absoluteStart - lastTimestampSecs >= TIMESTAMP_INTERVAL_SECS || lastTimestampSecs === -999) {
       const h = Math.floor(absoluteStart / 3600);

@@ -651,15 +651,11 @@ export default function Home() {
         )}
 
         {status === 'done' && (
-          <>
-            <StatusStepper status="done" />
-            <ProcessLogs logs={logs} isProcessing={false} />
-            <TranscriptWorkspace
-              rawTranscript={rawTranscript}
-              polishedTranscript={polishedTranscript}
-              onReset={handleReset}
-            />
-          </>
+          <TranscriptWorkspace
+            rawTranscript={rawTranscript}
+            polishedTranscript={polishedTranscript}
+            onReset={handleReset}
+          />
         )}
       </div>
     </main>
