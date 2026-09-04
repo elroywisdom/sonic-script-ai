@@ -2,7 +2,10 @@
 
 import { useCallback, useRef, useState } from 'react';
 
-const ACCEPTED_FORMATS = ['.mp4', '.mov', '.avi', '.webm'];
+const ACCEPTED_FORMATS = [
+  '.mp4', '.mov', '.avi', '.webm',
+  '.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg'
+];
 const SIZE_WARNING_BYTES = 100 * 1024 * 1024;
 
 interface UploadZoneProps {
@@ -28,7 +31,7 @@ export default function UploadZone({ onStart, disabled }: UploadZoneProps) {
     const extension = `.${file.name.split('.').pop()?.toLowerCase() || ''}`;
     if (!ACCEPTED_FORMATS.includes(extension)) {
       setFormatError(
-        `Unsupported format. Accepted: ${ACCEPTED_FORMATS.join(', ')}`
+        `Unsupported format. Accepted: MP4, MOV, MP3, WAV, M4A, AAC, FLAC, WebM`
       );
       return false;
     }
@@ -133,10 +136,10 @@ export default function UploadZone({ onStart, disabled }: UploadZoneProps) {
         </div>
 
         <p className="text-lg font-semibold text-foreground mb-1">
-          Drop your video here
+          Drop your audio or video file here
         </p>
         <p className="text-sm text-muted-foreground">
-          or click to browse — MP4, MOV, AVI, WebM
+          or click to browse — MP3, WAV, M4A, MP4, MOV, WebM
         </p>
       </div>
 
