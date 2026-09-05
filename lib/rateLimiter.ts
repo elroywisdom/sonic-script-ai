@@ -50,41 +50,108 @@ export interface RetryOptions {
 }
 
 /**
- * Fetch wrapper that automatically retries HTTP 429 (Rate Limited) errors
- * using exponential backoff or the Retry-After header.
+ * Parses Groq / API error messages for suggested retry delay times.
+ * Example: "Please try again in 1s." or "Please try again in 2.5m."
+ */
+function parseRetryDelayMs(errorText: string): number | null {
+  const matchSecs = errorText.match(/try again in ([\d\.]+)\s*s/i);
+  if (matchSecs) {
+    const secs = parseFloat(matchSecs[1]);
+    if (!isNaN(secs) && secs > 0) return Math.ceil(secs * 1000);
+  }
+
+  const matchMins = errorText.match(/try again in ([\d\.]+)\s*m/i);
+  if (matchMins) {
+    const mins = parseFloat(matchMins[1]);
+    if (!isNaN(mins) && mins > 0) return Math.ceil(mins * 60 * 1000);
+  }
+
+  return null;
+}
+
+/**
+ * Fetch wrapper that automatically retries HTTP 429, 400 (Quota Rate Limit),
+ * and 5xx transient server errors with smart backoff and log notifications.
  */
 export async function fetchWithRetry(
   url: string,
   options: RequestInit,
   retryOptions?: RetryOptions
 ): Promise<Response> {
-  const maxAttempts = retryOptions?.maxAttempts ?? 5;
+  const maxAttempts = retryOptions?.maxAttempts ?? 8;
   let attempt = 0;
 
   while (attempt < maxAttempts) {
     attempt++;
     const res = await fetch(url, options);
 
-    if (res.status === 429) {
-      const retryAfterHeader = res.headers.get('Retry-After');
+    if (res.ok) {
+      return res;
+    }
+
+    // Inspect non-200 responses to check for retryable rate limits or server errors
+    const contentType = res.headers.get('content-type') || '';
+    let errorText = '';
+    let isRateLimit = res.status === 429;
+
+    try {
+      const clone = res.clone();
+      if (contentType.includes('application/json')) {
+        const json = await clone.json();
+        errorText =
+          (typeof json.detail === 'string' && json.detail) ||
+          (typeof json.error === 'string' && json.error) ||
+          (typeof json.error?.message === 'string' && json.error.message) ||
+          JSON.stringify(json);
+      } else {
+        errorText = await clone.text();
+      }
+    } catch {
+      // Ignore parsing errors
+    }
+
+    // Detect rate limit keywords in 400/429 status responses
+    if (
+      res.status === 429 ||
+      res.status === 400 ||
+      errorText.toLowerCase().includes('rate limit') ||
+      errorText.toLowerCase().includes('rate_limit_exceeded') ||
+      errorText.toLowerCase().includes('seconds of audio per hour')
+    ) {
+      isRateLimit = true;
+    }
+
+    // Retry on rate limit or 5xx server errors
+    if (isRateLimit || res.status >= 500) {
       let delayMs = Math.pow(2, attempt) * 1000;
 
+      // Check header or parse message for exact retry delay
+      const retryAfterHeader = res.headers.get('Retry-After');
       if (retryAfterHeader) {
-        const parsedSeconds = parseInt(retryAfterHeader, 10);
-        if (!isNaN(parsedSeconds) && parsedSeconds > 0) {
-          delayMs = parsedSeconds * 1000;
+        const parsedSecs = parseInt(retryAfterHeader, 10);
+        if (!isNaN(parsedSecs) && parsedSecs > 0) {
+          delayMs = parsedSecs * 1000;
+        }
+      } else {
+        const parsedBodyDelay = parseRetryDelayMs(errorText);
+        if (parsedBodyDelay !== null) {
+          delayMs = parsedBodyDelay + 1000; // Add 1s safety margin
         }
       }
 
-      delayMs = Math.min(60000, delayMs); // Cap backoff at 60s
-      const reason = `Groq API rate limit reached (HTTP 429). Retrying attempt ${attempt}/${maxAttempts} in ${(delayMs / 1000).toFixed(1)}s...`;
+      delayMs = Math.min(120000, delayMs); // Cap backoff at 120s
 
-      retryOptions?.onRetry?.(attempt, delayMs, reason);
+      const shortReason = isRateLimit
+        ? `Groq rate limit reached ("${errorText.slice(0, 120)}..."). Auto-retrying attempt ${attempt}/${maxAttempts} in ${(delayMs / 1000).toFixed(1)}s...`
+        : `Server error (${res.status}). Auto-retrying attempt ${attempt}/${maxAttempts} in ${(delayMs / 1000).toFixed(1)}s...`;
+
+      retryOptions?.onRetry?.(attempt, delayMs, shortReason);
 
       await new Promise((resolve) => setTimeout(resolve, delayMs));
       continue;
     }
 
+    // Non-retryable error
     return res;
   }
 

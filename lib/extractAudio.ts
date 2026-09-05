@@ -256,8 +256,8 @@ export async function extractAudioChunks(
         CHUNK_DURATION_SECONDS
       );
       
-      onLog?.(`Encoding chunk ${idx}/${chunkCount}...`);
-      const sliceEncoded = encodeWav(slice);
+      onLog?.(`Encoding chunk ${idx}/${chunkCount} with Opus compression...`);
+      const sliceEncoded = await encodeAudioOpus(slice, onLog);
       onLog?.(`Encoded chunk ${idx}/${chunkCount}: size = ${(sliceEncoded.blob.size / (1024 * 1024)).toFixed(2)} MB`);
       chunks.push({
         ...sliceEncoded,

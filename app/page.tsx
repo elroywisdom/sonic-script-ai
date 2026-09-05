@@ -307,128 +307,6 @@ export default function Home() {
     }
   }, [addLog]);
 
-  const retryTranscriptionOnly = useCallback(async () => {
-    const audioChunks = audioChunksRef.current;
-    if (!audioChunks || audioChunks.length === 0) {
-      if (currentFileRef.current) {
-        runPipeline(currentFileRef.current);
-      }
-      return;
-    }
-
-    setErrorMessage('');
-    let currentStep: PipelineStep = 'transcribing';
-
-    try {
-      setStatus('transcribing');
-      currentStep = 'transcribing';
-      addLog(`Resuming transcription with ${audioChunks.length} cached audio chunk(s)...`, 'info');
-
-      let raw = '';
-      if (audioChunks.length === 1) {
-        addLog(`Uploading audio file '${audioChunks[0].filename}' (${(audioChunks[0].blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
-        const transcribeForm = new FormData();
-        transcribeForm.append('audio', audioChunks[0].blob, audioChunks[0].filename);
-        transcribeForm.append('filename', audioChunks[0].filename);
-        transcribeForm.append('offset', '0');
-
-        const res = await fetch('/api/transcribe', {
-          method: 'POST',
-          body: transcribeForm,
-        });
-        const contentType = res.headers.get('content-type') || '';
-        let transcribeData: Record<string, unknown> = {};
-        if (contentType.includes('application/json')) {
-          transcribeData = await res.json();
-        } else {
-          const errText = await res.text();
-          throw new Error(`Server returned non-JSON error (${res.status}): ${errText.slice(0, 200)}`);
-        }
-        if (!res.ok) {
-          throw new Error(getResponseError(transcribeData));
-        }
-        raw = transcribeData.rawTranscript as string;
-        addLog('Transcription completed successfully.', 'success');
-      } else {
-        addLog(`Starting sequential transcription of ${audioChunks.length} chunks to prevent rate limits and timeouts...`, 'info');
-        const transcripts: string[] = [];
-        
-        for (let i = 0; i < audioChunks.length; i++) {
-          const chunk = audioChunks[i];
-          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading '${chunk.filename}' (${(chunk.blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
-
-          const transcribeForm = new FormData();
-          transcribeForm.append('audio', chunk.blob, chunk.filename);
-          transcribeForm.append('filename', chunk.filename);
-          const chunkOffset = i * 120; // 120 seconds (2 minutes) per chunk
-          transcribeForm.append('offset', String(chunkOffset));
-
-          const res = await fetch('/api/transcribe', {
-            method: 'POST',
-            body: transcribeForm,
-          });
-          const contentType = res.headers.get('content-type') || '';
-          let transcribeData: Record<string, unknown> = {};
-          if (contentType.includes('application/json')) {
-            transcribeData = await res.json();
-          } else {
-            const errText = await res.text();
-            throw new Error(`Server returned non-JSON error (${res.status}): ${errText.slice(0, 200)}`);
-          }
-          if (!res.ok) {
-            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Failed: ${getResponseError(transcribeData)}`, 'error');
-            throw new Error(getResponseError(transcribeData));
-          }
-
-          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Transcribed successfully.`, 'success');
-          transcripts.push(transcribeData.rawTranscript as string);
-
-          if (i < audioChunks.length - 1) {
-            await new Promise((resolve) => setTimeout(resolve, 500));
-          }
-        }
-
-        raw = transcripts.join(' ').trim();
-        addLog('All audio chunks transcribed successfully.', 'success');
-      }
-
-      setRawTranscript(raw);
-
-      setStatus('refining');
-      currentStep = 'refining';
-      addLog(`Sending raw transcript (${raw.length} characters) to DeepSeek-Chat for refining & polishing...`, 'info');
-      const refineRes = await fetch('/api/refine', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rawTranscript: raw }),
-      });
-
-      const refineContentType = refineRes.headers.get('content-type') || '';
-      let refineData: Record<string, unknown> = {};
-      if (refineContentType.includes('application/json')) {
-        refineData = await refineRes.json();
-      } else {
-        const errText = await refineRes.text();
-        throw new Error(`Refine server error (${refineRes.status}): ${errText.slice(0, 200)}`);
-      }
-      if (!refineRes.ok) {
-        throw new Error(getResponseError(refineData));
-      }
-
-      const polished = (refineData.polishedTranscript as string) || raw;
-      setPolishedTranscript(polished);
-      addLog(`Polishing completed successfully (${polished.length} characters).`, 'success');
-      setStatus('done');
-      addLog('Pipeline completed successfully! Enjoy your transcript.', 'success');
-    } catch (error) {
-      const errMsg = getErrorMessage(error);
-      addLog(`Error during step '${currentStep}': ${errMsg}`, 'error');
-      setFailedStep(currentStep);
-      setStatus('error');
-      setErrorMessage(errMsg);
-    }
-  }, [addLog, runPipeline]);
-
   const runQuizPipeline = useCallback(async (transcript: string) => {
     setPastedTranscript(transcript);
     setErrorMessage('');
@@ -517,12 +395,10 @@ export default function Home() {
       } else if (failedStep === 'generating_captions') {
         runCaptionsPipeline(pastedTranscript);
       }
-    } else if (failedStep === 'transcribing' && audioChunksRef.current.length > 0) {
-      retryTranscriptionOnly();
     } else if (currentFileRef.current) {
       runPipeline(currentFileRef.current);
     }
-  }, [activeTab, pastedTranscript, runPipeline, retryTranscriptionOnly, runQuizPipeline, runCaptionsPipeline, failedStep]);
+  }, [activeTab, pastedTranscript, runPipeline, runQuizPipeline, runCaptionsPipeline, failedStep]);
 
   const handleReset = useCallback(() => {
     currentFileRef.current = null;
