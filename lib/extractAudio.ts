@@ -1,6 +1,9 @@
+import { extractAudioWebCodecs, isWebCodecsSupported } from './webcodecsExtractor';
+import { encodeAudioOpus, encodeWav } from './compressAudio';
+
 const TARGET_SAMPLE_RATE = 16000;
 const GROQ_MAX_BYTES = 4 * 1024 * 1024; // 4MB limit to stay under Vercel's 4.5MB serverless payload limit
-const CHUNK_DURATION_SECONDS = 120; // 2-minute segments (approx 3.66MB at 16kHz mono 16-bit PCM)
+export const CHUNK_DURATION_SECONDS = 300; // 5-minute segments (approx 1.2MB in Opus / 9.6MB in WAV)
 
 export interface ExtractedAudio {
   blob: Blob;
@@ -55,60 +58,6 @@ function resampleToMono16kHz(
   return offlineContext.startRendering();
 }
 
-function encodeWav(audioBuffer: AudioBuffer): Blob {
-  const channelData = audioBuffer.getChannelData(0);
-  const sampleRate = audioBuffer.sampleRate;
-  const numSamples = channelData.length;
-  const bytesPerSample = 2;
-  const blockAlign = bytesPerSample;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = numSamples * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  const writeString = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
-    }
-  };
-
-  writeString(0, 'RIFF');
-  view.setUint32(4, 36 + dataSize, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true);
-  view.setUint16(22, 1, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, 16, true);
-  writeString(36, 'data');
-  view.setUint32(40, dataSize, true);
-
-  let offset = 44;
-  for (let i = 0; i < numSamples; i++) {
-    const sample = Math.max(-1, Math.min(1, channelData[i]));
-    const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-    view.setInt16(offset, intSample, true);
-    offset += 2;
-  }
-
-  return new Blob([buffer], { type: 'audio/wav' });
-}
-
-async function encodeAudio(
-  audioBuffer: AudioBuffer,
-  onLog?: (msg: string) => void
-): Promise<{ blob: Blob; filename: string }> {
-  onLog?.('Encoding audio directly to WAV (16kHz, 16-bit mono PCM)...');
-  const blob = encodeWav(audioBuffer);
-  return {
-    blob,
-    filename: 'audio.wav',
-  };
-}
-
 function sliceAudioBuffer(
   audioContext: AudioContext,
   buffer: AudioBuffer,
@@ -132,7 +81,7 @@ async function extractAudioFromVideoElement(
   videoFile: File,
   onLog?: (msg: string) => void
 ): Promise<AudioBuffer> {
-  onLog?.('Creating media stream from video element...');
+  onLog?.('Creating media stream from video element fallback...');
   const videoUrl = URL.createObjectURL(videoFile);
   const video = document.createElement('video');
   video.src = videoUrl;
@@ -234,42 +183,34 @@ async function getDecodedAudioBuffer(
   onLog?: (msg: string) => void
 ): Promise<AudioBuffer> {
   try {
-    onLog?.('Loading video file buffer...');
+    onLog?.('Loading video file buffer for decodeAudioData...');
     const arrayBuffer = await videoFile.arrayBuffer();
     onLog?.('Decoding audio data with Web Audio API...');
     const decoded = await audioContext.decodeAudioData(arrayBuffer);
     onLog?.(`Audio decoded successfully. Duration: ${decoded.duration.toFixed(1)}s, channels: ${decoded.numberOfChannels}, sample rate: ${decoded.sampleRate}Hz`);
     return decoded;
   } catch (err) {
-    onLog?.(`Web Audio decodeAudioData failed (${err instanceof Error ? err.message : String(err)}). Switching to HTML5 Video element fallback extractor...`);
+    onLog?.(`Web Audio decodeAudioData failed (${err instanceof Error ? err.message : String(err)}).`);
+
+    // Check if WebCodecs hardware accelerated demuxer is available
+    if (isWebCodecsSupported()) {
+      try {
+        onLog?.('Switching to WebCodecs API (hardware-accelerated demuxer + AudioDecoder)...');
+        const pcmFloat32 = await extractAudioWebCodecs(videoFile, onLog);
+        const durationSecs = pcmFloat32.length / TARGET_SAMPLE_RATE;
+
+        const buffer = audioContext.createBuffer(1, pcmFloat32.length, TARGET_SAMPLE_RATE);
+        buffer.getChannelData(0).set(pcmFloat32);
+        onLog?.(`[WebCodecs] Created AudioBuffer directly (${durationSecs.toFixed(1)}s, 16kHz mono).`);
+        return buffer;
+      } catch (wcErr) {
+        onLog?.(`[WebCodecs] Extraction failed (${wcErr instanceof Error ? wcErr.message : String(wcErr)}). Falling back to HTML5 Video stream playback...`);
+      }
+    } else {
+      onLog?.('WebCodecs not available in browser. Falling back to HTML5 Video stream playback...');
+    }
+
     return await extractAudioFromVideoElement(videoFile, onLog);
-  }
-}
-
-export async function extractAudio(
-  videoFile: File,
-  onLog?: (msg: string) => void
-): Promise<ExtractedAudio> {
-  onLog?.(`Loading video file: ${videoFile.name} (${(videoFile.size / (1024 * 1024)).toFixed(2)} MB)`);
-  onLog?.('Initializing AudioContext...');
-  const audioContext = new AudioContext();
-
-  try {
-    const decodedBuffer = await getDecodedAudioBuffer(videoFile, audioContext, onLog);
-    
-    onLog?.('Resampling audio to 16kHz mono...');
-    const resampledBuffer = await resampleToMono16kHz(audioContext, decodedBuffer, onLog);
-    onLog?.('Resampling complete.');
-    
-    const encoded = await encodeAudio(resampledBuffer, onLog);
-    onLog?.(`Audio extraction finished. Format: ${encoded.filename}, Size: ${(encoded.blob.size / (1024 * 1024)).toFixed(2)} MB`);
-
-    return {
-      ...encoded,
-      durationSeconds: resampledBuffer.duration,
-    };
-  } finally {
-    await audioContext.close();
   }
 }
 
@@ -277,6 +218,7 @@ export async function extractAudioChunks(
   videoFile: File,
   onLog?: (msg: string) => void
 ): Promise<ExtractedAudio[]> {
+  console.time('extractAudio');
   onLog?.(`Loading video file: ${videoFile.name} (${(videoFile.size / (1024 * 1024)).toFixed(2)} MB)`);
   onLog?.('Initializing AudioContext...');
   const audioContext = new AudioContext();
@@ -288,11 +230,12 @@ export async function extractAudioChunks(
     const resampledBuffer = await resampleToMono16kHz(audioContext, decodedBuffer, onLog);
     onLog?.('Resampling complete.');
     
-    onLog?.('Checking encoded size...');
-    const encoded = await encodeAudio(resampledBuffer, onLog);
+    onLog?.('Checking encoded audio size...');
+    const encoded = encodeWav(resampledBuffer);
 
     if (encoded.blob.size <= GROQ_MAX_BYTES) {
       onLog?.(`Audio size (${(encoded.blob.size / (1024 * 1024)).toFixed(2)} MB) is below 4MB limit. No chunking needed.`);
+      console.timeEnd('extractAudio');
       return [{ ...encoded, durationSeconds: resampledBuffer.duration }];
     }
 
@@ -314,7 +257,7 @@ export async function extractAudioChunks(
       );
       
       onLog?.(`Encoding chunk ${idx}/${chunkCount}...`);
-      const sliceEncoded = await encodeAudio(slice, onLog);
+      const sliceEncoded = encodeWav(slice);
       onLog?.(`Encoded chunk ${idx}/${chunkCount}: size = ${(sliceEncoded.blob.size / (1024 * 1024)).toFixed(2)} MB`);
       chunks.push({
         ...sliceEncoded,
@@ -324,9 +267,9 @@ export async function extractAudioChunks(
     }
 
     onLog?.(`All chunks extracted and encoded. Total chunks: ${chunks.length}`);
+    console.timeEnd('extractAudio');
     return chunks;
   } finally {
     await audioContext.close();
   }
 }
-

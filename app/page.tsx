@@ -8,7 +8,7 @@ import PasteTranscriptZone from '@/components/PasteTranscriptZone';
 import QuizWorkspace, { type Question } from '@/components/QuizWorkspace';
 import CaptionWorkspace, { type CaptionData } from '@/components/CaptionWorkspace';
 import ProcessLogs, { type LogEntry } from '@/components/ProcessLogs';
-import { extractAudioChunks, type ExtractedAudio } from '@/lib/extractAudio';
+import { extractAudioChunks, CHUNK_DURATION_SECONDS, type ExtractedAudio } from '@/lib/extractAudio';
 
 import ProcessingDashboard from '@/components/ProcessingDashboard';
 import {
@@ -176,33 +176,29 @@ export default function Home() {
         addLog('Transcription completed successfully.', 'success');
         setProgressPercent(90);
       } else {
-        addLog(`Starting sequential transcription of ${audioChunks.length} chunks to prevent rate limits and timeouts...`, 'info');
-        const transcripts: string[] = [];
+        addLog(`Starting parallel transcription of ${audioChunks.length} chunks (concurrency pool size: 4)...`, 'info');
+        const transcripts: string[] = new Array(audioChunks.length);
         const existingRecord = await getCachedRecord(fileKey);
         const existingTranscripts = existingRecord?.transcripts || {};
 
-        for (let i = 0; i < audioChunks.length; i++) {
-          setCurrentChunkIndex(i + 1);
-          // Transcription represents 50% to 90% progress
-          const currentPct = 50 + Math.round(((i + 1) / audioChunks.length) * 40);
-          setProgressPercent(currentPct);
-          
-          const remChunkSecs = Math.max(5, (audioChunks.length - i) * 3);
-          setEstimatedRemainingSeconds(remChunkSecs);
+        let completedCount = 0;
 
+        const transcribeChunk = async (chunk: ExtractedAudio, i: number) => {
           if (existingTranscripts[i]) {
             addLog(`[Chunk ${i + 1}/${audioChunks.length}] Loaded from browser cache.`, 'success');
-            transcripts.push(existingTranscripts[i]);
-            continue;
+            transcripts[i] = existingTranscripts[i];
+            completedCount++;
+            const currentPct = 50 + Math.round((completedCount / audioChunks.length) * 40);
+            setProgressPercent(currentPct);
+            return existingTranscripts[i];
           }
 
-          const chunk = audioChunks[i];
           addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading '${chunk.filename}' (${(chunk.blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
 
           const transcribeForm = new FormData();
           transcribeForm.append('audio', chunk.blob, chunk.filename);
           transcribeForm.append('filename', chunk.filename);
-          const chunkOffset = i * 120; // 120 seconds (2 minutes) per chunk
+          const chunkOffset = i * CHUNK_DURATION_SECONDS;
           transcribeForm.append('offset', String(chunkOffset));
 
           const res = await fetch('/api/transcribe', {
@@ -224,13 +220,36 @@ export default function Home() {
 
           const chunkText = transcribeData.rawTranscript as string;
           addLog(`[Chunk ${i + 1}/${audioChunks.length}] Transcribed successfully.`, 'success');
-          transcripts.push(chunkText);
+          transcripts[i] = chunkText;
           await saveChunkTranscript(fileKey, i, chunkText);
 
-          if (i < audioChunks.length - 1) {
-            await new Promise((resolve) => setTimeout(resolve, 500));
+          completedCount++;
+          const currentPct = 50 + Math.round((completedCount / audioChunks.length) * 40);
+          setProgressPercent(currentPct);
+          setCurrentChunkIndex(completedCount);
+
+          const remChunkSecs = Math.max(5, Math.ceil((audioChunks.length - completedCount) / 4) * 4);
+          setEstimatedRemainingSeconds(remChunkSecs);
+
+          return chunkText;
+        };
+
+        // Run bounded concurrency pool (up to 4 active uploads)
+        const CONCURRENCY_LIMIT = 4;
+        let poolIndex = 0;
+
+        const worker = async () => {
+          while (poolIndex < audioChunks.length) {
+            const idx = poolIndex++;
+            await transcribeChunk(audioChunks[idx], idx);
           }
-        }
+        };
+
+        const workers = Array.from(
+          { length: Math.min(CONCURRENCY_LIMIT, audioChunks.length) },
+          () => worker()
+        );
+        await Promise.all(workers);
 
         raw = transcripts.join(' ').trim();
         addLog('All audio chunks transcribed successfully.', 'success');
