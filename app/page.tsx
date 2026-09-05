@@ -17,6 +17,7 @@ import {
   saveChunkTranscript,
   type CachedRecord,
 } from '@/lib/audioCache';
+import { RollingRateLimiter, fetchWithRetry } from '@/lib/rateLimiter';
 
 type PipelineStep = 'extracting' | 'transcribing' | 'refining' | 'generating_quiz' | 'generating_captions';
 
@@ -146,65 +147,77 @@ export default function Home() {
       setTotalChunks(audioChunks.length);
       addLog(`Extraction complete. Created ${audioChunks.length} audio chunk(s) for transcription.`, 'success');
 
-      let raw = '';
-      if (audioChunks.length === 1) {
-        setCurrentChunkIndex(1);
-        setProgressPercent(60);
-        addLog(`Uploading audio file '${audioChunks[0].filename}' (${(audioChunks[0].blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
-        const transcribeForm = new FormData();
-        transcribeForm.append('audio', audioChunks[0].blob, audioChunks[0].filename);
-        transcribeForm.append('filename', audioChunks[0].filename);
-        transcribeForm.append('offset', '0');
+      const rawTranscripts: string[] = new Array(audioChunks.length);
+      const polishedChunks: string[] = new Array(audioChunks.length);
+      const existingRecord = await getCachedRecord(fileKey);
+      const existingTranscripts = existingRecord?.transcripts || {};
 
-        const res = await fetch('/api/transcribe', {
-          method: 'POST',
-          body: transcribeForm,
-        });
-        const contentType = res.headers.get('content-type') || '';
-        let transcribeData: Record<string, unknown> = {};
-        if (contentType.includes('application/json')) {
-          transcribeData = await res.json();
+      const rateLimiter = new RollingRateLimiter(18, 60000);
+      let completedCount = 0;
+
+      const processChunk = async (chunk: ExtractedAudio, i: number) => {
+        let chunkRawText = '';
+
+        if (existingTranscripts[i]) {
+          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Loaded from browser cache.`, 'success');
+          chunkRawText = existingTranscripts[i];
+          rawTranscripts[i] = chunkRawText;
         } else {
-          const errText = await res.text();
-          throw new Error(`Server returned non-JSON error (${res.status}): ${errText.slice(0, 200)}`);
-        }
-        if (!res.ok) {
-          throw new Error(getResponseError(transcribeData));
-        }
-        raw = transcribeData.rawTranscript as string;
-        await saveChunkTranscript(fileKey, 0, raw);
-        addLog('Transcription completed successfully.', 'success');
-        setProgressPercent(90);
-      } else {
-        addLog(`Starting parallel transcription of ${audioChunks.length} chunks (concurrency pool size: 4)...`, 'info');
-        const transcripts: string[] = new Array(audioChunks.length);
-        const existingRecord = await getCachedRecord(fileKey);
-        const existingTranscripts = existingRecord?.transcripts || {};
+          // Acquire rate limiter slot (18 RPM rolling window cap)
+          await rateLimiter.acquire((waitTimeMs, currentRPM) => {
+            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Groq RPM safety window reached (${currentRPM} requests in last 60s). Pausing ${(waitTimeMs / 1000).toFixed(1)}s...`, 'info');
+          });
 
-        let completedCount = 0;
-
-        const transcribeChunk = async (chunk: ExtractedAudio, i: number) => {
-          if (existingTranscripts[i]) {
-            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Loaded from browser cache.`, 'success');
-            transcripts[i] = existingTranscripts[i];
-            completedCount++;
-            const currentPct = 50 + Math.round((completedCount / audioChunks.length) * 40);
-            setProgressPercent(currentPct);
-            return existingTranscripts[i];
+          // Check if R2 Presigned Upload is available
+          let r2UploadedKey: string | null = null;
+          try {
+            const urlRes = await fetch('/api/upload-url', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ filename: chunk.filename, contentType: chunk.blob.type }),
+            });
+            const urlData = await urlRes.json();
+            if (urlRes.ok && urlData.enabled && urlData.uploadUrl) {
+              addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading directly to Cloudflare R2 presigned URL (bypassing Vercel 4.5MB limit)...`, 'info');
+              await fetch(urlData.uploadUrl, {
+                method: 'PUT',
+                headers: { 'Content-Type': chunk.blob.type },
+                body: chunk.blob,
+              });
+              r2UploadedKey = urlData.key;
+            }
+          } catch (err) {
+            // R2 unavailable or failed, fallback to direct payload upload
           }
 
-          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading '${chunk.filename}' (${(chunk.blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
+          let res: Response;
+          if (r2UploadedKey) {
+            res = await fetchWithRetry('/api/transcribe', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                r2Key: r2UploadedKey,
+                filename: chunk.filename,
+                offset: i * CHUNK_DURATION_SECONDS,
+              }),
+            }, {
+              onRetry: (_attempt, _delayMs, reason) => addLog(`[Chunk ${i + 1}/${audioChunks.length}] ${reason}`, 'info'),
+            });
+          } else {
+            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading '${chunk.filename}' (${(chunk.blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
+            const transcribeForm = new FormData();
+            transcribeForm.append('audio', chunk.blob, chunk.filename);
+            transcribeForm.append('filename', chunk.filename);
+            transcribeForm.append('offset', String(i * CHUNK_DURATION_SECONDS));
 
-          const transcribeForm = new FormData();
-          transcribeForm.append('audio', chunk.blob, chunk.filename);
-          transcribeForm.append('filename', chunk.filename);
-          const chunkOffset = i * CHUNK_DURATION_SECONDS;
-          transcribeForm.append('offset', String(chunkOffset));
+            res = await fetchWithRetry('/api/transcribe', {
+              method: 'POST',
+              body: transcribeForm,
+            }, {
+              onRetry: (_attempt, _delayMs, reason) => addLog(`[Chunk ${i + 1}/${audioChunks.length}] ${reason}`, 'info'),
+            });
+          }
 
-          const res = await fetch('/api/transcribe', {
-            method: 'POST',
-            body: transcribeForm,
-          });
           const contentType = res.headers.get('content-type') || '';
           let transcribeData: Record<string, unknown> = {};
           if (contentType.includes('application/json')) {
@@ -218,75 +231,73 @@ export default function Home() {
             throw new Error(getResponseError(transcribeData));
           }
 
-          const chunkText = transcribeData.rawTranscript as string;
+          chunkRawText = transcribeData.rawTranscript as string;
+          rawTranscripts[i] = chunkRawText;
+          await saveChunkTranscript(fileKey, i, chunkRawText);
           addLog(`[Chunk ${i + 1}/${audioChunks.length}] Transcribed successfully.`, 'success');
-          transcripts[i] = chunkText;
-          await saveChunkTranscript(fileKey, i, chunkText);
+        }
 
-          completedCount++;
-          const currentPct = 50 + Math.round((completedCount / audioChunks.length) * 40);
-          setProgressPercent(currentPct);
-          setCurrentChunkIndex(completedCount);
+        completedCount++;
+        const currentPct = 50 + Math.round((completedCount / audioChunks.length) * 35);
+        setProgressPercent(currentPct);
+        setCurrentChunkIndex(completedCount);
 
-          const remChunkSecs = Math.max(5, Math.ceil((audioChunks.length - completedCount) / 4) * 4);
-          setEstimatedRemainingSeconds(remChunkSecs);
+        const remChunkSecs = Math.max(5, Math.ceil((audioChunks.length - completedCount) / 4) * 4);
+        setEstimatedRemainingSeconds(remChunkSecs);
 
-          return chunkText;
-        };
-
-        // Run bounded concurrency pool (up to 4 active uploads)
-        const CONCURRENCY_LIMIT = 4;
-        let poolIndex = 0;
-
-        const worker = async () => {
-          while (poolIndex < audioChunks.length) {
-            const idx = poolIndex++;
-            await transcribeChunk(audioChunks[idx], idx);
+        // PIPELINED REFINEMENT: Immediately trigger refinement for this chunk in parallel!
+        if (chunkRawText && chunkRawText.trim()) {
+          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Starting pipelined refinement (Groq Llama 3.3 70B)...`, 'info');
+          try {
+            const refineRes = await fetch('/api/refine', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ rawTranscript: chunkRawText }),
+            });
+            if (refineRes.ok) {
+              const refineData = await refineRes.json();
+              polishedChunks[i] = (refineData.polishedTranscript as string) || chunkRawText;
+              addLog(`[Chunk ${i + 1}/${audioChunks.length}] Pipelined refinement complete.`, 'success');
+            } else {
+              polishedChunks[i] = chunkRawText;
+            }
+          } catch (err) {
+            polishedChunks[i] = chunkRawText;
           }
-        };
+        } else {
+          polishedChunks[i] = '';
+        }
+      };
 
-        const workers = Array.from(
-          { length: Math.min(CONCURRENCY_LIMIT, audioChunks.length) },
-          () => worker()
-        );
-        await Promise.all(workers);
+      addLog(`Starting parallel transcription & pipelined refinement of ${audioChunks.length} chunks (18 RPM rate limiter + 429 retry active)...`, 'info');
 
-        raw = transcripts.join(' ').trim();
-        addLog('All audio chunks transcribed successfully.', 'success');
-      }
+      // Bounded concurrency pool (4 active slots)
+      const CONCURRENCY_LIMIT = 4;
+      let poolIndex = 0;
 
-      setRawTranscript(raw);
+      const worker = async () => {
+        while (poolIndex < audioChunks.length) {
+          const idx = poolIndex++;
+          await processChunk(audioChunks[idx], idx);
+        }
+      };
 
-      setStatus('refining');
-      currentStep = 'refining';
-      setProgressPercent(92);
-      setEstimatedRemainingSeconds(10);
-      addLog(`Sending raw transcript (${raw.length} characters) to DeepSeek-Chat for refining & polishing...`, 'info');
-      const refineRes = await fetch('/api/refine', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rawTranscript: raw }),
-      });
+      const workers = Array.from(
+        { length: Math.min(CONCURRENCY_LIMIT, audioChunks.length) },
+        () => worker()
+      );
+      await Promise.all(workers);
 
-      const refineContentType = refineRes.headers.get('content-type') || '';
-      let refineData: Record<string, unknown> = {};
-      if (refineContentType.includes('application/json')) {
-        refineData = await refineRes.json();
-      } else {
-        const errText = await refineRes.text();
-        throw new Error(`Refine server error (${refineRes.status}): ${errText.slice(0, 200)}`);
-      }
-      if (!refineRes.ok) {
-        throw new Error(getResponseError(refineData));
-      }
+      const assembledRaw = rawTranscripts.filter(Boolean).join(' ').trim();
+      const assembledPolished = polishedChunks.filter(Boolean).join('\n\n').trim() || assembledRaw;
 
-      const polished = (refineData.polishedTranscript as string) || raw;
-      setPolishedTranscript(polished);
+      setRawTranscript(assembledRaw);
+      setPolishedTranscript(assembledPolished);
+
       setProgressPercent(100);
       setEstimatedRemainingSeconds(0);
-      addLog(`Polishing completed successfully (${polished.length} characters).`, 'success');
       setStatus('done');
-      addLog('Pipeline completed successfully! Enjoy your transcript.', 'success');
+      addLog('Pipeline completed successfully! Enjoy your polished transcript.', 'success');
     } catch (error) {
       const errMsg = getErrorMessage(error);
       addLog(`Error during step '${currentStep}': ${errMsg}`, 'error');

@@ -1,5 +1,5 @@
-const DEEPSEEK_API_URL = 'https://api.deepseek.com/chat/completions';
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const DEEPSEEK_API_URL = 'https://api.deepseek.com/chat/completions';
 
 const REFINE_SYSTEM_PROMPT = `You are an elite post-production transcript editor. Your task is to take raw, unpunctuated Speech-to-Text output and transform it into a professional, highly readable script.
 
@@ -12,19 +12,20 @@ Rules:
 
 async function refineSingleChunk(
   text: string,
-  deepseekKey?: string,
-  groqKey?: string
+  groqKey?: string,
+  deepseekKey?: string
 ): Promise<string> {
-  if (deepseekKey) {
+  // Primary default: Groq Llama 3.3 70B (Zero-budget free tier)
+  if (groqKey) {
     try {
-      const res = await fetch(DEEPSEEK_API_URL, {
+      const res = await fetch(GROQ_CHAT_URL, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${deepseekKey}`,
+          Authorization: `Bearer ${groqKey}`,
         },
         body: JSON.stringify({
-          model: 'deepseek-chat',
+          model: 'llama-3.3-70b-versatile',
           messages: [
             { role: 'system', content: REFINE_SYSTEM_PROMPT },
             { role: 'user', content: text },
@@ -36,25 +37,30 @@ async function refineSingleChunk(
       if (res.ok) {
         const data = await res.json();
         const content = data.choices?.[0]?.message?.content?.trim();
+        const usage = data.usage;
+        if (usage) {
+          console.log(`[Refine LLM] Groq Llama 3.3 70B tokens used: prompt=${usage.prompt_tokens}, completion=${usage.completion_tokens}, total=${usage.total_tokens}`);
+        }
         if (content) return content;
       } else {
-        const errText = await res.text();
-        console.warn(`DeepSeek API failed with status ${res.status}: ${errText}`);
+        const errorText = await res.text();
+        console.warn(`Groq refine API call failed with status ${res.status}: ${errorText}`);
       }
     } catch (err) {
-      console.warn('DeepSeek refine API call failed, attempting Groq fallback...', err);
+      console.warn('Groq refine API call failed, attempting DeepSeek fallback...', err);
     }
   }
 
-  if (groqKey) {
-    const res = await fetch(GROQ_CHAT_URL, {
+  // Fallback: DeepSeek-Chat if provided
+  if (deepseekKey) {
+    const res = await fetch(DEEPSEEK_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${groqKey}`,
+        Authorization: `Bearer ${deepseekKey}`,
       },
       body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
+        model: 'deepseek-chat',
         messages: [
           { role: 'system', content: REFINE_SYSTEM_PROMPT },
           { role: 'user', content: text },
@@ -73,7 +79,7 @@ async function refineSingleChunk(
     if (content) return content;
   }
 
-  throw new Error('No valid LLM API key configured for refinement');
+  throw new Error('No valid LLM API key (GROQ_API_KEY or DEEPSEEK_API_KEY) configured for refinement');
 }
 
 export async function refineTranscript(rawTranscript: string): Promise<string> {
@@ -81,8 +87,8 @@ export async function refineTranscript(rawTranscript: string): Promise<string> {
     return '';
   }
 
-  const deepseekKey = process.env.DEEPSEEK_API_KEY;
   const groqKey = process.env.GROQ_API_KEY;
+  const deepseekKey = process.env.DEEPSEEK_API_KEY;
 
   const maxChunkLength = 8000;
   if (rawTranscript.length > maxChunkLength) {
@@ -102,11 +108,11 @@ export async function refineTranscript(rawTranscript: string): Promise<string> {
 
     const polishedChunks: string[] = [];
     for (const chunk of chunks) {
-      const polished = await refineSingleChunk(chunk, deepseekKey, groqKey);
+      const polished = await refineSingleChunk(chunk, groqKey, deepseekKey);
       polishedChunks.push(polished);
     }
     return polishedChunks.join('\n\n').trim();
   }
 
-  return await refineSingleChunk(rawTranscript, deepseekKey, groqKey);
+  return await refineSingleChunk(rawTranscript, groqKey, deepseekKey);
 }
