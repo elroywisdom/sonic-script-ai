@@ -1,3 +1,5 @@
+import { callLLM } from './llmClient';
+
 export interface YouTubeCaptions {
   titles: string[];
   description: string;
@@ -65,17 +67,6 @@ function normalizeCaptionData(parsed: Record<string, unknown>): CaptionData {
 }
 
 export async function generateCaptionsFromTranscript(transcript: string): Promise<CaptionData> {
-  const apiKey = process.env.GROQ_API_KEY || process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) {
-    throw new Error('No API key configured for captions generation');
-  }
-
-  const isGroq = Boolean(process.env.GROQ_API_KEY);
-  const url = isGroq
-    ? 'https://api.groq.com/openai/v1/chat/completions'
-    : 'https://api.deepseek.com/chat/completions';
-  const model = isGroq ? 'llama-3.3-70b-versatile' : 'deepseek-chat';
-
   const systemPrompt = `You are an elite social media strategist. Generate a multi-platform social media content pack based on the transcript.
 Return ONLY valid JSON matching this exact format:
 {
@@ -102,29 +93,14 @@ Return ONLY valid JSON matching this exact format:
   }
 }`;
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: transcript.slice(0, 15000) },
-      ],
-      temperature: 0.5,
-    }),
+  const text = await callLLM({
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: transcript.slice(0, 15000) },
+    ],
+    temperature: 0.5,
+    responseFormatJson: true,
   });
-
-  if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Captions generation API error (${res.status}): ${errText}`);
-  }
-
-  const data = await res.json();
-  const text = data.choices?.[0]?.message?.content?.trim() || '';
 
   try {
     const parsed = JSON.parse(text);
