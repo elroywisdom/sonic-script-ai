@@ -39,11 +39,12 @@ export interface CaptionData {
 interface CaptionWorkspaceProps {
   data: CaptionData;
   onClose: () => void;
+  embedded?: boolean;
 }
 
 type Platform = 'youtube' | 'instagram' | 'linkedin' | 'whatsapp' | 'tiktok';
 
-export default function CaptionWorkspace({ data, onClose }: CaptionWorkspaceProps) {
+export default function CaptionWorkspace({ data, onClose, embedded = false }: CaptionWorkspaceProps) {
   const [activePlatform, setActivePlatform] = useState<Platform>('youtube');
   const [copiedSection, setCopiedSection] = useState<string | null>(null);
 
@@ -118,7 +119,7 @@ export default function CaptionWorkspace({ data, onClose }: CaptionWorkspaceProp
   };
 
   return (
-    <div className="w-full max-w-3xl mx-auto mt-8 p-6 sm:p-8 rounded-2xl border border-white/10 bg-white/[0.02] backdrop-blur-xl space-y-6 animate-fade-in relative overflow-hidden shadow-[0_12px_40px_rgba(0,0,0,0.5)]">
+    <div className={`w-full max-w-3xl mx-auto p-6 sm:p-8 rounded-2xl border border-white/10 bg-white/[0.02] backdrop-blur-xl space-y-6 animate-fade-in relative overflow-hidden shadow-[0_12px_40px_rgba(0,0,0,0.5)] ${embedded ? 'mt-0' : 'mt-8'}`}>
       {/* Glow backgrounds */}
       <div className="absolute top-0 right-0 w-32 h-32 rounded-full bg-accent/5 blur-2xl pointer-events-none" />
       <div className="absolute bottom-0 left-0 w-32 h-32 rounded-full bg-purple-500/5 blur-2xl pointer-events-none" />
