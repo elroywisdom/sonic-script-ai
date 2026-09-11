@@ -121,13 +121,18 @@ export default function Home() {
       const cached = await getCachedRecord(fileKey);
       let audioChunks: ExtractedAudio[] = [];
 
-      if (cached && cached.chunks.length > 0) {
+      const hasOversizedChunk = cached?.chunks?.some((c) => c.blob.size > 3.2 * 1024 * 1024);
+
+      if (cached && cached.chunks.length > 0 && !hasOversizedChunk) {
         addLog(`Found cached audio extractions for '${file.name}' in browser storage (${cached.chunks.length} chunks). Skipping extraction phase!`, 'success');
         audioChunks = cached.chunks;
         audioChunksRef.current = audioChunks;
         setTotalDurationSeconds(cached.durationSeconds || 0);
         setProgressPercent(50);
       } else {
+        if (hasOversizedChunk) {
+          addLog(`Cached extractions for '${file.name}' contain chunks exceeding Vercel's payload limit. Re-extracting with optimized 90s chunks...`, 'info');
+        }
         setStatus('extracting');
         currentStep = 'extracting';
         addLog(`Initializing extraction pipeline for ${file.name}...`, 'info');
@@ -179,15 +184,18 @@ export default function Home() {
             const urlData = await urlRes.json();
             if (urlRes.ok && urlData.enabled && urlData.uploadUrl) {
               addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading directly to Cloudflare R2 presigned URL (bypassing Vercel 4.5MB limit)...`, 'info');
-              await fetch(urlData.uploadUrl, {
+              const r2PutRes = await fetch(urlData.uploadUrl, {
                 method: 'PUT',
                 headers: { 'Content-Type': chunk.blob.type },
                 body: chunk.blob,
               });
+              if (!r2PutRes.ok) {
+                throw new Error(`R2 HTTP ${r2PutRes.status}: ${r2PutRes.statusText}`);
+              }
               r2UploadedKey = urlData.key;
             }
           } catch (err) {
-            // R2 unavailable or failed, fallback to direct payload upload
+            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Direct R2 upload bypass notice: ${err instanceof Error ? err.message : String(err)}. Using direct API payload...`, 'info');
           }
 
           let res: Response;

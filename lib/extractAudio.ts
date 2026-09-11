@@ -2,8 +2,8 @@ import { extractAudioWebCodecs, isWebCodecsSupported } from './webcodecsExtracto
 import { encodeAudioOpus, encodeWav } from './compressAudio';
 
 const TARGET_SAMPLE_RATE = 16000;
-const GROQ_MAX_BYTES = 4 * 1024 * 1024; // 4MB limit to stay under Vercel's 4.5MB serverless payload limit
-export const CHUNK_DURATION_SECONDS = 300; // 5-minute segments (approx 1.2MB in Opus / 9.6MB in WAV)
+const GROQ_MAX_BYTES = 3 * 1024 * 1024; // 3MB limit to stay safely under Vercel's 4.5MB serverless payload limit
+export const CHUNK_DURATION_SECONDS = 90; // 90-second segments (approx 2.7MB per 16kHz mono WAV chunk)
 
 export interface ExtractedAudio {
   blob: Blob;
