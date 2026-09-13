@@ -1,21 +1,20 @@
-import type { Metadata } from 'next';
-import { Inter, JetBrains_Mono } from 'next/font/google';
-import './globals.css';
+import type { Metadata } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
 
-const inter = Inter({
-  subsets: ['latin'],
-  variable: '--font-inter',
+const geistSans = Geist({
+  variable: "--font-geist-sans",
+  subsets: ["latin"],
 });
 
-const jetbrainsMono = JetBrains_Mono({
-  subsets: ['latin'],
-  variable: '--font-jetbrains-mono',
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
 });
 
 export const metadata: Metadata = {
-  title: 'TM Labs SonicScript AI',
-  description:
-    'Extract, transcribe, and polish video audio into clean, readable scripts.',
+  title: "Sonic AI — Multi-Modal Creative & Media Studio",
+  description: "Next-generation AI studio for audio transcription, viral short clips, and generative AI filmmaking.",
 };
 
 export default function RootLayout({
@@ -24,8 +23,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`${inter.variable} ${jetbrainsMono.variable}`}>
-      <body className="font-sans antialiased min-h-screen bg-background text-foreground">
+    <html lang="en" className={`${geistSans.variable} ${geistMono.variable} dark`} suppressHydrationWarning>
+      <body className="min-h-screen bg-[#0D0D0D] text-white antialiased font-sans selection:bg-[#00D4B4]/30 selection:text-[#00D4B4]" suppressHydrationWarning>
         {children}
       </body>
     </html>

@@ -2,76 +2,115 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --background: #0d0d0d;
-  --foreground: #ffffff;
-  --accent: #00d4b4;
+@layer base {
+  :root {
+    --background: #0d0d0d;
+    --foreground: #ffffff;
+
+    --card: #141416;
+    --card-foreground: #ffffff;
+
+    --popover: #1a1a1e;
+    --popover-foreground: #ffffff;
+
+    --primary: #00d4b4;
+    --primary-foreground: #000000;
+
+    --secondary: #1e202e;
+    --secondary-foreground: #ffffff;
+
+    --muted: #1a1a1a;
+    --muted-foreground: #888888;
+
+    --accent: #00d4b4;
+    --accent-foreground: #000000;
+    --accent-glow: rgba(0, 212, 180, 0.35);
+
+    --destructive: #ef4444;
+    --destructive-foreground: #ffffff;
+
+    --border: rgba(255, 255, 255, 0.08);
+    --input: rgba(255, 255, 255, 0.12);
+    --ring: #00d4b4;
+
+    --radius: 0.75rem;
+
+    --studio-accent: #00d4b4;
+    --studio-indigo-glow: rgba(0, 212, 180, 0.35);
+  }
 }
 
-body {
-  color: var(--foreground);
-  background: var(--background);
+@layer base {
+  * {
+    @apply border-border;
+    box-sizing: border-box;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
+  }
 }
 
-* {
-  box-sizing: border-box;
+/* Glassmorphism tokens */
+.glass {
+  background: rgba(26, 26, 30, 0.7);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-/* Sleek custom scrollbars based on modern guidelines */
-.scroller {
+.glass-card {
+  background: rgba(20, 20, 22, 0.65);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.glow-accent {
+  box-shadow: 0 0 20px rgba(0, 212, 180, 0.3);
+}
+
+.glow-primary {
+  box-shadow: 0 0 20px rgba(0, 212, 180, 0.35);
+}
+
+/* Sleek custom scrollbars */
+.scroller, ::-webkit-scrollbar {
   --scrollbar-thumb: rgba(255, 255, 255, 0.15);
   --scrollbar-track: rgba(0, 0, 0, 0.2);
-
   scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
   scrollbar-width: thin;
 }
 
-@supports not (scrollbar-color: auto) {
-  .scroller::-webkit-scrollbar {
-    width: 6px;
-    height: 6px;
-  }
-
-  .scroller::-webkit-scrollbar-thumb {
-    background: var(--scrollbar-thumb);
-    border-radius: 3px;
-  }
-
-  .scroller::-webkit-scrollbar-track {
-    background: var(--scrollbar-track);
-  }
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
 }
 
-/* Premium micro-animations for interactive UI components */
+/* Custom micro-animations */
 @keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes slideDown {
-  from {
-    opacity: 0;
-    transform: translateY(-8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(-8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes pulseGlow {
-  0%, 100% {
-    box-shadow: 0 0 15px rgba(0, 212, 180, 0.15);
-  }
-  50% {
-    box-shadow: 0 0 25px rgba(0, 212, 180, 0.35);
-  }
+  0%, 100% { box-shadow: 0 0 15px rgba(0, 212, 180, 0.15); }
+  50% { box-shadow: 0 0 25px rgba(0, 212, 180, 0.35); }
 }
 
 .animate-fade-in {
@@ -84,4 +123,20 @@ body {
 
 .animate-pulse-glow {
   animation: pulseGlow 2s infinite ease-in-out;
+}
+
+/* Marquee Animation */
+@keyframes marquee {
+  0% { transform: translateX(0%); }
+  100% { transform: translateX(-50%); }
+}
+
+.animate-marquee {
+  display: flex;
+  width: max-content;
+  animation: marquee 35s linear infinite;
+}
+
+.animate-marquee:hover {
+  animation-play-state: paused;
 }

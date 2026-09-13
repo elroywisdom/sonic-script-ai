@@ -1,577 +1,586 @@
-'use client';
+"use client";
 
-import { useCallback, useRef, useState } from 'react';
-import StatusStepper, { type AppStatus } from '@/components/StatusStepper';
-import TranscriptWorkspace from '@/components/TranscriptWorkspace';
-import UploadZone from '@/components/UploadZone';
-import PasteTranscriptZone from '@/components/PasteTranscriptZone';
-import QuizWorkspace, { type Question } from '@/components/QuizWorkspace';
-import CaptionWorkspace, { type CaptionData } from '@/components/CaptionWorkspace';
-import ProcessLogs, { type LogEntry } from '@/components/ProcessLogs';
-import { extractAudioChunks, CHUNK_DURATION_SECONDS, type ExtractedAudio } from '@/lib/extractAudio';
-
-import ProcessingDashboard from '@/components/ProcessingDashboard';
+import { useState } from "react";
+import Link from "next/link";
+import Image from "next/image";
 import {
-  saveCachedChunks,
-  getCachedRecord,
-  saveChunkTranscript,
-  type CachedRecord,
-} from '@/lib/audioCache';
-import { RollingRateLimiter, fetchWithRetry } from '@/lib/rateLimiter';
+  Zap,
+  Mic,
+  ArrowRight,
+  Share2,
+  Clock,
+  ShieldCheck,
+  Copy,
+  Check,
+  FileText,
+  CheckCircle2,
+  Scissors,
+  ChevronDown,
+  Menu,
+  X,
+  FileAudio,
+  Download,
+  Sparkles
+} from "lucide-react";
 
-type PipelineStep = 'extracting' | 'transcribing' | 'refining' | 'generating_quiz' | 'generating_captions';
+export default function HomePage() {
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [copiedTab, setCopiedTab] = useState<string | null>(null);
+  const [activeTab, setActiveTab] = useState<"summary" | "linkedin" | "x">("summary");
 
-function getErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message;
-  return 'An unexpected error occurred. Please try again.';
-}
+  const handleCopy = (key: string, text: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedTab(key);
+    setTimeout(() => setCopiedTab(null), 2000);
+  };
 
-function getResponseError(data: Record<string, unknown>): string {
-  return (
-    (typeof data.detail === 'string' && data.detail) ||
-    (typeof data.error === 'string' && data.error) ||
-    (typeof data.message === 'string' && data.message) ||
-    'Request failed'
-  );
-}
+  const copySamples = {
+    summary: "Key Decisions & Action Items:\n\n• Approved Q4 product priorities: ship automatic meeting notes and launch instant PDF exports.\n• Sarah will finalize the client onboarding workflow by Friday.\n• Alex is optimizing audio processing so 1-hour recordings process in under 5 seconds.\n• Next review scheduled for next Tuesday at 10 AM.",
+    linkedin: "I used to spend 3 hours every week listening back to recordings and typing out meeting notes.\n\nNow I drop the audio into Sonic AI. In 5 seconds, I get:\n- Full word-for-word transcript with speaker names\n- 4 bullet action items\n- A clean executive summary ready to paste into Slack\n\nStop wasting time on busywork. Automate the notes so you can focus on the work.",
+    x: "Stop taking notes during meetings.\n\nJust record the call, drop the file in Sonic AI, and let it pull the key action items and quotes in 5 seconds.\n\nYour time is worth more than manual transcription."
+  };
 
-function getFileKey(file: File): string {
-  return `${file.name}_${file.size}_${file.lastModified}`;
-}
-
-export default function Home() {
-  const [status, setStatus] = useState<AppStatus>('idle');
-  const [errorMessage, setErrorMessage] = useState('');
-  const [failedStep, setFailedStep] = useState<PipelineStep>('extracting');
-  const [rawTranscript, setRawTranscript] = useState('');
-  const [polishedTranscript, setPolishedTranscript] = useState('');
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [activeTab, setActiveTab] = useState<'video' | 'text'>('video');
-  const [pastedTranscript, setPastedTranscript] = useState('');
-  const [quizQuestions, setQuizQuestions] = useState<Question[]>([]);
-  const [captionsData, setCaptionsData] = useState<CaptionData | null>(null);
-  
-  // Dashboard calculation states
-  const [progressPercent, setProgressPercent] = useState(0);
-  const [estimatedRemainingSeconds, setEstimatedRemainingSeconds] = useState(0);
-  const [totalDurationSeconds, setTotalDurationSeconds] = useState(0);
-  const [currentChunkIndex, setCurrentChunkIndex] = useState(1);
-  const [totalChunks, setTotalChunks] = useState(1);
-  const [cachedRecordFound, setCachedRecordFound] = useState<CachedRecord | null>(null);
-
-  const audioChunksRef = useRef<ExtractedAudio[]>([]);
-  const currentFileRef = useRef<File | null>(null);
-  const startTimeRef = useRef<number>(0);
-
-  const isProcessing =
-    status === 'extracting' ||
-    status === 'transcribing' ||
-    status === 'refining' ||
-    status === 'generating_quiz' ||
-    status === 'generating_captions';
-
-  const addLog = useCallback((message: string, type: LogEntry['type'] = 'info') => {
-    const elapsedSecs = (Date.now() - startTimeRef.current) / 1000;
-    const pad = (num: number) => String(num).padStart(2, '0');
-    const mins = Math.floor(elapsedSecs / 60);
-    const secs = Math.floor(elapsedSecs % 60);
-    const ms = Math.floor((elapsedSecs % 1) * 10);
-    const timestamp = `${pad(mins)}:${pad(secs)}.${ms}`;
-
-    // Parse progress percentages and duration metrics from log messages
-    if (message.includes('complete') && message.includes('%')) {
-      const match = message.match(/(\d+)%\s+complete/);
-      if (match) {
-        const extractPct = parseInt(match[1], 10);
-        // Extraction represents 0-50% of total pipeline
-        const overallPct = Math.round((extractPct / 100) * 50);
-        setProgressPercent(overallPct);
-      }
-    }
-    if (message.includes('Duration:')) {
-      const durMatch = message.match(/Duration:\s*([\d\.]+)s/);
-      if (durMatch) {
-        const durationSecs = parseFloat(durMatch[1]);
-        setTotalDurationSeconds(durationSecs);
-        // 8x speed extraction estimate (duration / 8) + buffer for transcription
-        const estSecs = Math.round(durationSecs / 8) + 60;
-        setEstimatedRemainingSeconds(estSecs);
-      }
-    }
-
-    setLogs((prev) => [...prev, { timestamp, message, type }]);
-  }, []);
-
-  const runPipeline = useCallback(async (file: File) => {
-    currentFileRef.current = file;
-    audioChunksRef.current = [];
-    setErrorMessage('');
-    setRawTranscript('');
-    setPolishedTranscript('');
-    setLogs([]);
-    setProgressPercent(0);
-    setEstimatedRemainingSeconds(120);
-    startTimeRef.current = Date.now();
-
-    const fileKey = getFileKey(file);
-    let currentStep: PipelineStep = 'extracting';
-
-    try {
-      // Check IndexedDB cache first
-      const cached = await getCachedRecord(fileKey);
-      let audioChunks: ExtractedAudio[] = [];
-
-      const hasOversizedChunk = cached?.chunks?.some((c) => c.blob.size > 3.2 * 1024 * 1024);
-
-      if (cached && cached.chunks.length > 0 && !hasOversizedChunk) {
-        addLog(`Found cached audio extractions for '${file.name}' in browser storage (${cached.chunks.length} chunks). Skipping extraction phase!`, 'success');
-        audioChunks = cached.chunks;
-        audioChunksRef.current = audioChunks;
-        setTotalDurationSeconds(cached.durationSeconds || 0);
-        setProgressPercent(50);
-      } else {
-        if (hasOversizedChunk) {
-          addLog(`Cached extractions for '${file.name}' contain chunks exceeding Vercel's payload limit. Re-extracting with optimized 90s chunks...`, 'info');
-        }
-        setStatus('extracting');
-        currentStep = 'extracting';
-        addLog(`Initializing extraction pipeline for ${file.name}...`, 'info');
-        audioChunks = await extractAudioChunks(file, (msg) => addLog(msg, 'info'));
-        audioChunksRef.current = audioChunks;
-
-        const dur = audioChunks.reduce((acc, c) => acc + c.durationSeconds, 0);
-        setTotalDurationSeconds(dur);
-
-        // Save extracted chunks to IndexedDB
-        await saveCachedChunks(fileKey, file.name, file.size, dur, audioChunks);
-        addLog(`Saved extracted audio chunks to local browser storage.`, 'info');
-      }
-
-      setStatus('transcribing');
-      currentStep = 'transcribing';
-      setTotalChunks(audioChunks.length);
-      addLog(`Extraction complete. Created ${audioChunks.length} audio chunk(s) for transcription.`, 'success');
-
-      const rawTranscripts: string[] = new Array(audioChunks.length);
-      const polishedChunks: string[] = new Array(audioChunks.length);
-      const existingRecord = await getCachedRecord(fileKey);
-      const existingTranscripts = existingRecord?.transcripts || {};
-
-      const rateLimiter = new RollingRateLimiter(18, 60000);
-      let completedCount = 0;
-
-      const processChunk = async (chunk: ExtractedAudio, i: number) => {
-        let chunkRawText = '';
-
-        if (existingTranscripts[i]) {
-          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Loaded from browser cache.`, 'success');
-          chunkRawText = existingTranscripts[i];
-          rawTranscripts[i] = chunkRawText;
-        } else {
-          // Acquire rate limiter slot (18 RPM rolling window cap)
-          await rateLimiter.acquire((waitTimeMs, currentRPM) => {
-            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Groq RPM safety window reached (${currentRPM} requests in last 60s). Pausing ${(waitTimeMs / 1000).toFixed(1)}s...`, 'info');
-          });
-
-          // Check if R2 Presigned Upload is available
-          let r2UploadedKey: string | null = null;
-          try {
-            const urlRes = await fetch('/api/upload-url', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ filename: chunk.filename, contentType: chunk.blob.type }),
-            });
-            const urlData = await urlRes.json();
-            if (urlRes.ok && urlData.enabled && urlData.uploadUrl) {
-              addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading directly to Cloudflare R2 presigned URL (bypassing Vercel 4.5MB limit)...`, 'info');
-              const r2PutRes = await fetch(urlData.uploadUrl, {
-                method: 'PUT',
-                headers: { 'Content-Type': chunk.blob.type },
-                body: chunk.blob,
-              });
-              if (!r2PutRes.ok) {
-                throw new Error(`R2 HTTP ${r2PutRes.status}: ${r2PutRes.statusText}`);
-              }
-              r2UploadedKey = urlData.key;
-            }
-          } catch (err) {
-            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Direct R2 upload bypass notice: ${err instanceof Error ? err.message : String(err)}. Using direct API payload...`, 'info');
-          }
-
-          let res: Response;
-          if (r2UploadedKey) {
-            res = await fetchWithRetry('/api/transcribe', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                r2Key: r2UploadedKey,
-                filename: chunk.filename,
-                offset: i * CHUNK_DURATION_SECONDS,
-              }),
-            }, {
-              onRetry: (_attempt, _delayMs, reason) => addLog(`[Chunk ${i + 1}/${audioChunks.length}] ${reason}`, 'info'),
-            });
-          } else {
-            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Uploading '${chunk.filename}' (${(chunk.blob.size / (1024 * 1024)).toFixed(2)} MB) to Groq Whisper...`, 'info');
-            const transcribeForm = new FormData();
-            transcribeForm.append('audio', chunk.blob, chunk.filename);
-            transcribeForm.append('filename', chunk.filename);
-            transcribeForm.append('offset', String(i * CHUNK_DURATION_SECONDS));
-
-            res = await fetchWithRetry('/api/transcribe', {
-              method: 'POST',
-              body: transcribeForm,
-            }, {
-              onRetry: (_attempt, _delayMs, reason) => addLog(`[Chunk ${i + 1}/${audioChunks.length}] ${reason}`, 'info'),
-            });
-          }
-
-          const contentType = res.headers.get('content-type') || '';
-          let transcribeData: Record<string, unknown> = {};
-          if (contentType.includes('application/json')) {
-            transcribeData = await res.json();
-          } else {
-            const errText = await res.text();
-            throw new Error(`Server returned non-JSON error (${res.status}): ${errText.slice(0, 200)}`);
-          }
-          if (!res.ok) {
-            addLog(`[Chunk ${i + 1}/${audioChunks.length}] Failed: ${getResponseError(transcribeData)}`, 'error');
-            throw new Error(getResponseError(transcribeData));
-          }
-
-          chunkRawText = transcribeData.rawTranscript as string;
-          rawTranscripts[i] = chunkRawText;
-          await saveChunkTranscript(fileKey, i, chunkRawText);
-          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Transcribed successfully.`, 'success');
-        }
-
-        completedCount++;
-        const currentPct = 50 + Math.round((completedCount / audioChunks.length) * 35);
-        setProgressPercent(currentPct);
-        setCurrentChunkIndex(completedCount);
-
-        const remChunkSecs = Math.max(5, Math.ceil((audioChunks.length - completedCount) / 4) * 4);
-        setEstimatedRemainingSeconds(remChunkSecs);
-
-        // PIPELINED REFINEMENT: Immediately trigger refinement for this chunk in parallel!
-        if (chunkRawText && chunkRawText.trim()) {
-          addLog(`[Chunk ${i + 1}/${audioChunks.length}] Starting pipelined refinement (Groq Llama 3.3 70B)...`, 'info');
-          try {
-            const refineRes = await fetch('/api/refine', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ rawTranscript: chunkRawText }),
-            });
-            if (refineRes.ok) {
-              const refineData = await refineRes.json();
-              polishedChunks[i] = (refineData.polishedTranscript as string) || chunkRawText;
-              addLog(`[Chunk ${i + 1}/${audioChunks.length}] Pipelined refinement complete.`, 'success');
-            } else {
-              polishedChunks[i] = chunkRawText;
-            }
-          } catch (err) {
-            polishedChunks[i] = chunkRawText;
-          }
-        } else {
-          polishedChunks[i] = '';
-        }
-      };
-
-      addLog(`Starting parallel transcription & pipelined refinement of ${audioChunks.length} chunks (18 RPM rate limiter + 429 retry active)...`, 'info');
-
-      // Bounded concurrency pool (4 active slots)
-      const CONCURRENCY_LIMIT = 4;
-      let poolIndex = 0;
-
-      const worker = async () => {
-        while (poolIndex < audioChunks.length) {
-          const idx = poolIndex++;
-          await processChunk(audioChunks[idx], idx);
-        }
-      };
-
-      const workers = Array.from(
-        { length: Math.min(CONCURRENCY_LIMIT, audioChunks.length) },
-        () => worker()
-      );
-      await Promise.all(workers);
-
-      const assembledRaw = rawTranscripts.filter(Boolean).join(' ').trim();
-      const assembledPolished = polishedChunks.filter(Boolean).join('\n\n').trim() || assembledRaw;
-
-      setRawTranscript(assembledRaw);
-      setPolishedTranscript(assembledPolished);
-
-      setProgressPercent(100);
-      setEstimatedRemainingSeconds(0);
-      setStatus('done');
-      addLog('Pipeline completed successfully! Enjoy your polished transcript.', 'success');
-    } catch (error) {
-      const errMsg = getErrorMessage(error);
-      addLog(`Error during step '${currentStep}': ${errMsg}`, 'error');
-      setFailedStep(currentStep);
-      setStatus('error');
-      setErrorMessage(errMsg);
-    }
-  }, [addLog]);
-
-  const runQuizPipeline = useCallback(async (transcript: string) => {
-    setPastedTranscript(transcript);
-    setErrorMessage('');
-    setQuizQuestions([]);
-    setLogs([]);
-    startTimeRef.current = Date.now();
-
-    try {
-      setStatus('generating_quiz');
-      setFailedStep('generating_quiz');
-      addLog('Initializing quiz generation pipeline...', 'info');
-      addLog('Analyzing transcript content...', 'info');
-      addLog(`Sending transcript (${transcript.length} characters) to AI for quiz generation...`, 'info');
-
-      const res = await fetch('/api/quiz', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcript }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(getResponseError(data));
-      }
-
-      setQuizQuestions(data.questions);
-      addLog('Quiz generated successfully! Loaded 5 questions.', 'success');
-      setStatus('quiz_only');
-    } catch (error) {
-      const errMsg = getErrorMessage(error);
-      addLog(`Error during quiz generation: ${errMsg}`, 'error');
-      setFailedStep('generating_quiz');
-      setStatus('error');
-      setErrorMessage(errMsg);
-    }
-  }, [addLog]);
-
-  const runCaptionsPipeline = useCallback(async (transcript: string) => {
-    setPastedTranscript(transcript);
-    setErrorMessage('');
-    setCaptionsData(null);
-    setLogs([]);
-    startTimeRef.current = Date.now();
-
-    try {
-      setStatus('generating_captions');
-      setFailedStep('generating_captions');
-      addLog('Initializing caption generation pipeline...', 'info');
-      addLog('Analyzing transcript content for platform optimization...', 'info');
-      addLog(`Sending transcript (${transcript.length} characters) to AI for captions...`, 'info');
-
-      const res = await fetch('/api/captions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ transcript }),
-      });
-
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(getResponseError(data));
-      }
-
-      setCaptionsData(data);
-      addLog('Social media captions generated successfully!', 'success');
-      setStatus('captions_only');
-    } catch (error) {
-      const errMsg = getErrorMessage(error);
-      addLog(`Error during captions generation: ${errMsg}`, 'error');
-      setFailedStep('generating_captions');
-      setStatus('error');
-      setErrorMessage(errMsg);
-    }
-  }, [addLog]);
-
-  const handleStart = useCallback(
-    (file: File) => {
-      runPipeline(file);
-    },
-    [runPipeline]
-  );
-
-  const handleRetry = useCallback(() => {
-    if (activeTab === 'text') {
-      if (failedStep === 'generating_quiz') {
-        runQuizPipeline(pastedTranscript);
-      } else if (failedStep === 'generating_captions') {
-        runCaptionsPipeline(pastedTranscript);
-      }
-    } else if (currentFileRef.current) {
-      runPipeline(currentFileRef.current);
-    }
-  }, [activeTab, pastedTranscript, runPipeline, runQuizPipeline, runCaptionsPipeline, failedStep]);
-
-  const handleReset = useCallback(() => {
-    currentFileRef.current = null;
-    setStatus('idle');
-    setErrorMessage('');
-    setFailedStep('extracting');
-    setRawTranscript('');
-    setPolishedTranscript('');
-    setPastedTranscript('');
-    setQuizQuestions([]);
-    setCaptionsData(null);
-    setLogs([]);
-  }, []);
+  const marqueeItems = [
+    { title: "Weekly Team All-Hands", duration: "42m", output: "Action items and decisions" },
+    { title: "Customer Discovery Interview", duration: "55m", output: "Key quotes and problem takeaways" },
+    { title: "Mobile Voice Memo", duration: "3m", output: "Formatted email draft" },
+    { title: "Founder Interview Recording", duration: "1h 10m", output: "Full transcript and summary" },
+    { title: "Strategy Planning Call", duration: "35m", output: "Executive recap document" },
+    { title: "University Research Lecture", duration: "50m", output: "Study guide and notes" },
+  ];
 
   return (
-    <main className="min-h-screen flex flex-col relative overflow-hidden bg-[#0d0d0d]">
-      {/* Glowing ambient backgrounds */}
-      <div className="absolute top-0 left-0 w-[500px] h-[500px] rounded-full bg-accent/5 blur-[120px] pointer-events-none -translate-x-1/2 -translate-y-1/2" />
-      <div className="absolute bottom-0 right-0 w-[600px] h-[600px] rounded-full bg-purple-500/[0.02] blur-[150px] pointer-events-none translate-x-1/3 translate-y-1/3" />
+    <div className="relative min-h-screen bg-[#000000] text-zinc-100 flex flex-col justify-between selection:bg-[#00D4B4] selection:text-black overflow-x-hidden">
+      {/* Subtle geometric dot grid */}
+      <div 
+        className="absolute inset-0 pointer-events-none opacity-[0.12]" 
+        style={{
+          backgroundImage: "radial-gradient(rgba(255, 255, 255, 0.15) 1px, transparent 1px)",
+          backgroundSize: "32px 32px"
+        }} 
+      />
 
-      <header className="border-b border-white/5 bg-black/20 backdrop-blur-md px-6 py-8 relative z-10">
-        <div className="max-w-6xl mx-auto">
-          <h1 className="text-2xl sm:text-3xl font-semibold tracking-tight">
-            TM Labs Sonic<span className="text-accent">Script</span> AI
-          </h1>
-          <p className="mt-2 text-sm text-muted-foreground max-w-2xl leading-relaxed">
-            Instantly transform video recordings into polished, shareable transcripts,
-            formatted markdown documentation, interactive comprehension quizzes, and
-            optimized social media captions.
-          </p>
+      {/* Top ambient spotlight */}
+      <div className="absolute -top-40 left-1/2 -translate-x-1/2 w-[900px] max-w-[100vw] h-[350px] sm:h-[450px] bg-gradient-to-b from-[#00D4B4]/15 via-[#00D4B4]/5 to-transparent blur-[120px] sm:blur-[140px] pointer-events-none" />
+
+      {/* Navigation Header - Mobile Optimized with Hamburger Drawer */}
+      <header className="fixed top-0 left-0 right-0 z-50 border-b border-white/[0.06] backdrop-blur-xl bg-black/80 px-4 sm:px-6 py-3 sm:py-4">
+        <div className="max-w-7xl mx-auto flex items-center justify-between">
+          <Link href="/" className="flex items-center gap-2.5">
+            <div className="w-7 h-7 sm:w-8 sm:h-8 rounded-lg bg-[#00D4B4] flex items-center justify-center shadow-[0_0_15px_rgba(0,212,180,0.35)]">
+              <Zap className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-[#0D0D0D] fill-current" />
+            </div>
+            <span className="text-sm sm:text-base font-semibold tracking-tight text-white">
+              Sonic AI
+            </span>
+          </Link>
+
+          {/* Desktop Navigation */}
+          <nav className="hidden md:flex items-center gap-7 text-xs font-medium text-zinc-400">
+            <a href="#features" className="hover:text-white transition">Features</a>
+            <Link href="/pricing" className="hover:text-white transition">Pricing</Link>
+            <Link href="/projects" className="hover:text-white transition">Studio</Link>
+          </nav>
+
+          {/* Right Action Buttons */}
+          <div className="flex items-center gap-2 sm:gap-3">
+            <Link 
+              href="/login" 
+              className="text-xs font-medium text-zinc-400 hover:text-white transition px-2.5 py-1.5 sm:px-3"
+            >
+              Sign In
+            </Link>
+            <Link
+              href="/register"
+              className="px-3.5 py-1.5 sm:px-4 sm:py-2 text-xs font-bold bg-[#00D4B4] hover:bg-[#00D4B4]/90 text-[#0D0D0D] rounded-xl transition shadow-lg shadow-[#00D4B4]/20 flex items-center gap-1.5 active:scale-95 whitespace-nowrap"
+            >
+              Start for free <ArrowRight className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
+            </Link>
+
+            {/* Mobile Hamburger Button */}
+            <button
+              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+              className="md:hidden p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-white/5 transition focus:outline-none"
+              aria-label="Toggle Navigation Menu"
+            >
+              {mobileMenuOpen ? <X className="w-5 h-5 text-white" /> : <Menu className="w-5 h-5" />}
+            </button>
+          </div>
         </div>
-      </header>
 
-      <div className="flex-1 flex flex-col items-center px-6 py-12 gap-8 w-full max-w-4xl mx-auto">
-        {status === 'idle' && (
-          <div className="w-full max-w-2xl mx-auto space-y-6">
-            <div className="flex border-b border-white/10 w-full mb-2">
-              <button
-                onClick={() => setActiveTab('video')}
-                disabled={isProcessing}
-                className={`flex-1 py-3 text-center text-xs sm:text-sm font-semibold tracking-wider uppercase border-b-2 transition-all duration-300 ${
-                  activeTab === 'video'
-                    ? 'border-accent text-accent'
-                    : 'border-transparent text-muted-foreground hover:text-white'
-                } disabled:opacity-50 disabled:cursor-not-allowed`}
+        {/* Mobile Dropdown Menu Drawer */}
+        {mobileMenuOpen && (
+          <div className="md:hidden pt-4 pb-5 px-2 border-t border-white/[0.08] mt-3 space-y-3 bg-black/95 backdrop-blur-2xl rounded-2xl animate-in fade-in slide-in-from-top-2 duration-200">
+            <div className="flex flex-col space-y-1">
+              <a
+                href="#features"
+                onClick={() => setMobileMenuOpen(false)}
+                className="px-3 py-2.5 rounded-lg text-sm font-medium text-zinc-300 hover:text-white hover:bg-white/5 transition flex items-center justify-between"
               >
-                Upload Video
-              </button>
-              <button
-                onClick={() => setActiveTab('text')}
-                disabled={isProcessing}
-                className={`flex-1 py-3 text-center text-xs sm:text-sm font-semibold tracking-wider uppercase border-b-2 transition-all duration-300 ${
-                  activeTab === 'text'
-                    ? 'border-accent text-accent'
-                    : 'border-transparent text-muted-foreground hover:text-white'
-                } disabled:opacity-50 disabled:cursor-not-allowed`}
+                <span>Features</span>
+                <span className="text-[10px] text-zinc-500 font-mono">Overview</span>
+              </a>
+              <Link
+                href="/pricing"
+                onClick={() => setMobileMenuOpen(false)}
+                className="px-3 py-2.5 rounded-lg text-sm font-medium text-zinc-300 hover:text-white hover:bg-white/5 transition flex items-center justify-between"
               >
-                Paste Transcript
-              </button>
+                <span>Pricing Plans</span>
+                <span className="text-[10px] text-[#00D4B4] font-mono">From $0</span>
+              </Link>
+              <Link
+                href="/projects"
+                onClick={() => setMobileMenuOpen(false)}
+                className="px-3 py-2.5 rounded-lg text-sm font-medium text-zinc-300 hover:text-white hover:bg-white/5 transition flex items-center justify-between"
+              >
+                <span>Studio Workspace</span>
+                <span className="text-[10px] text-zinc-500 font-mono">Direct App</span>
+              </Link>
+              <Link
+                href="/login"
+                onClick={() => setMobileMenuOpen(false)}
+                className="px-3 py-2.5 rounded-lg text-sm font-medium text-zinc-300 hover:text-white hover:bg-white/5 transition"
+              >
+                Sign In
+              </Link>
             </div>
 
-            {activeTab === 'video' ? (
-              <UploadZone onStart={handleStart} disabled={isProcessing} />
-            ) : (
-              <PasteTranscriptZone
-                onGenerate={runQuizPipeline}
-                onGenerateCaptions={runCaptionsPipeline}
-                disabled={isProcessing}
-              />
-            )}
+            <div className="pt-2">
+              <Link
+                href="/register"
+                onClick={() => setMobileMenuOpen(false)}
+                className="w-full py-3 px-4 rounded-xl bg-[#00D4B4] hover:bg-[#00D4B4]/90 text-[#0D0D0D] font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-[#00D4B4]/25 active:scale-[0.98] transition"
+              >
+                Start Transcribing Free <ArrowRight className="w-4 h-4" />
+              </Link>
+            </div>
           </div>
         )}
+      </header>
 
-        {(status === 'extracting' || status === 'transcribing' || status === 'refining' || (status === 'error' && failedStep !== 'generating_quiz' && failedStep !== 'generating_captions')) && (
-          <>
-            <StatusStepper
-              status={status}
-              errorMessage={errorMessage}
-              failedStep={failedStep as 'extracting' | 'transcribing' | 'refining'}
-              onRetry={handleRetry}
-            />
-            <ProcessingDashboard
-              status={status}
-              logs={logs}
-              progressPercent={progressPercent}
-              estimatedRemainingSeconds={estimatedRemainingSeconds}
-              totalDurationSeconds={totalDurationSeconds}
-              currentChunkIndex={currentChunkIndex}
-              totalChunks={totalChunks}
-              onRetry={handleRetry}
-              errorMessage={errorMessage}
-            />
-          </>
-        )}
+      {/* =========================================================
+          FIRST 100VH: MOBILE-RESPONSIVE CLEAN HERO
+          ========================================================= */}
+      <section className="relative w-full min-h-[100dvh] flex flex-col items-center justify-center text-center px-4 sm:px-6 pt-20 pb-8 sm:pt-16 sm:pb-6 overflow-hidden">
+        
+        {/* Ambient Center Radial Glow */}
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[320px] sm:w-[600px] h-[220px] sm:h-[300px] bg-[#00D4B4]/10 rounded-full blur-[90px] sm:blur-[130px] pointer-events-none z-0" />
 
-        {(status === 'generating_quiz' || status === 'generating_captions' || (status === 'error' && (failedStep === 'generating_quiz' || failedStep === 'generating_captions'))) && (
-          <>
-            <div className="w-full max-w-3xl mx-auto bg-white/[0.01] border border-white/5 p-8 rounded-2xl backdrop-blur-xl shadow-[0_8px_30px_rgba(0,0,0,0.3)] flex flex-col items-center justify-center gap-6 animate-fade-in relative overflow-hidden">
-              <div className="absolute top-0 right-0 w-32 h-32 rounded-full bg-accent/5 blur-2xl pointer-events-none" />
-              
-              {status === 'generating_quiz' || status === 'generating_captions' ? (
-                <div className="flex flex-col items-center justify-center gap-4 text-center">
-                  <div className="relative w-16 h-16 flex items-center justify-center">
-                    <span className="absolute inset-0 rounded-full border border-accent/20 animate-ping opacity-60" />
-                    <div className="w-12 h-12 rounded-full border-2 border-accent border-t-transparent animate-spin flex items-center justify-center shadow-[0_0_15px_rgba(0,212,180,0.2)]" />
-                  </div>
-                  <div className="space-y-1">
-                    <h3 className="text-lg font-semibold text-foreground">
-                      {status === 'generating_quiz' ? 'Generating Quiz Questions' : 'Generating Social Captions'}
-                    </h3>
-                    <p className="text-sm text-muted-foreground">
-                      {status === 'generating_quiz' 
-                        ? 'AI is reading the transcript and formulating comprehension questions...' 
-                        : 'AI is reading the transcript and crafting optimized social media posts...'}
-                    </p>
-                  </div>
-                </div>
-              ) : (
-                <div className="flex flex-col items-center justify-center gap-4 text-center w-full">
-                  <div className="w-12 h-12 rounded-full bg-red-500/10 text-red-400 border-2 border-red-500 flex items-center justify-center shadow-[0_0_15px_rgba(239,68,68,0.2)]">
-                    <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                    </svg>
-                  </div>
-                  <div className="space-y-1">
-                    <h3 className="text-lg font-semibold text-red-400">
-                      {failedStep === 'generating_quiz' ? 'Quiz Generation Failed' : 'Captions Generation Failed'}
-                    </h3>
-                    <p className="text-sm text-muted-foreground max-w-md mx-auto">{errorMessage || 'Something went wrong. Please try again.'}</p>
-                  </div>
-                  <button
-                    onClick={handleRetry}
-                    className="mt-2 px-6 py-2.5 rounded-lg text-xs font-semibold uppercase tracking-wider bg-red-500/10 text-red-300 border border-red-500/20 hover:bg-red-500/20 hover:text-white transition-all duration-200"
-                  >
-                    Try again
-                  </button>
-                </div>
-              )}
+        {/* Hero Content */}
+        <div className="relative z-10 flex flex-col items-center max-w-4xl mx-auto w-full">
+
+
+          {/* Headline (4-Line Natural Wrap - Mobile Optimized) */}
+          <h1 className="text-[28px] xs:text-3xl sm:text-5xl lg:text-6xl font-bold tracking-tight text-white leading-[1.18] sm:leading-[1.15] text-balance">
+            <span className="block">Turn any audio or video into clean text.</span>
+            <span className="block mt-1 text-transparent bg-clip-text bg-gradient-to-r from-[#00D4B4] via-emerald-200 to-white">
+              Notes, summaries, and action items in seconds.
+            </span>
+          </h1>
+
+          {/* Clean Subtitle */}
+          <p className="mt-3.5 sm:mt-6 text-xs xs:text-sm sm:text-base lg:text-lg text-zinc-300 max-w-2xl px-2 sm:px-0 leading-relaxed text-balance">
+            Drop any meeting, interview, podcast, or video recording. Get exact word-for-word transcripts, clear action items, and ready-to-share summaries without doing the tedious work.
+          </p>
+
+          {/* SINGLE PROMINENT PRIMARY CTA - Responsive Touch Target */}
+          <div className="mt-7 sm:mt-9 flex flex-col items-center gap-2.5 sm:gap-3 w-full sm:w-auto px-2 sm:px-0">
+            <Link
+              href="/projects"
+              className="w-full sm:w-auto px-8 py-3.5 sm:py-4 bg-[#00D4B4] hover:bg-[#00D4B4]/90 text-[#0D0D0D] font-bold rounded-full transition text-sm sm:text-base shadow-[0_0_30px_rgba(0,212,180,0.4)] hover:shadow-[0_0_45px_rgba(0,212,180,0.6)] flex items-center justify-center gap-2.5 active:scale-[0.98] transform hover:-translate-y-0.5"
+            >
+              Start Transcribing Free <ArrowRight className="w-4 h-4 sm:w-5 sm:h-5" />
+            </Link>
+
+            {/* Reassurance text below CTA */}
+            <p className="text-[11px] sm:text-xs text-zinc-400 font-medium text-center px-2">
+              No credit card required • 30 free minutes every month • Instant setup
+            </p>
+          </div>
+
+          {/* CONTINUOUS AUDIO SOUNDWAVE MARQUEE BELOW THE BUTTON */}
+          <div className="mt-6 sm:mt-10 w-full max-w-4xl lg:max-w-5xl overflow-hidden relative py-1 sm:py-2">
+            {/* Left & Right Soft Fade Masks */}
+            <div className="absolute left-0 top-0 bottom-0 w-10 sm:w-24 bg-gradient-to-r from-black via-black/80 to-transparent z-10 pointer-events-none" />
+            <div className="absolute right-0 top-0 bottom-0 w-10 sm:w-24 bg-gradient-to-l from-black via-black/80 to-transparent z-10 pointer-events-none" />
+
+            <div className="animate-marquee flex items-center gap-1 sm:gap-1.5 h-10 sm:h-16 opacity-75 hover:opacity-100 transition-opacity duration-300">
+              {[...[15, 28, 45, 62, 85, 95, 70, 48, 25, 18, 35, 55, 78, 92, 100, 84, 60, 38, 22, 16, 40, 65, 88, 98, 75, 50, 32, 20, 48, 72, 90, 80, 58, 35, 20, 15, 30, 52, 75, 92, 85, 62, 40, 22, 18, 35, 60, 82, 96, 78, 55, 30, 18, 42, 68, 88, 72, 48, 28, 15], ...[15, 28, 45, 62, 85, 95, 70, 48, 25, 18, 35, 55, 78, 92, 100, 84, 60, 38, 22, 16, 40, 65, 88, 98, 75, 50, 32, 20, 48, 72, 90, 80, 58, 35, 20, 15, 30, 52, 75, 92, 85, 62, 40, 22, 18, 35, 60, 82, 96, 78, 55, 30, 18, 42, 68, 88, 72, 48, 28, 15]].map((height, i) => (
+                <div
+                  key={i}
+                  style={{
+                    height: `${height}%`,
+                    animation: `pulseGlow 2s infinite ease-in-out ${i * 0.04}s`,
+                  }}
+                  className={`w-0.5 sm:w-1 rounded-full transition-all duration-200 ${
+                    i % 6 === 0
+                      ? "bg-[#00D4B4]"
+                      : i % 3 === 0
+                      ? "bg-emerald-300/80"
+                      : i % 2 === 0
+                      ? "bg-zinc-600"
+                      : "bg-zinc-800"
+                  }`}
+                />
+              ))}
             </div>
-            <ProcessLogs logs={logs} isProcessing={isProcessing} />
-          </>
-        )}
+          </div>
+        </div>
 
-        {status === 'quiz_only' && (
-          <QuizWorkspace
-            questions={quizQuestions}
-            onClose={handleReset}
-          />
-        )}
+        {/* Perfectly Centered Scroll Indicator */}
+        <div className="absolute bottom-6 inset-x-0 mx-auto flex flex-col items-center justify-center gap-1 text-zinc-500 text-[11px] font-medium pointer-events-none z-10 text-center">
+          <span>Scroll to explore</span>
+          <ChevronDown className="w-3.5 h-3.5 animate-bounce" />
+        </div>
+      </section>
 
-        {status === 'captions_only' && captionsData && (
-          <CaptionWorkspace
-            data={captionsData}
-            onClose={handleReset}
-          />
-        )}
+      {/* =========================================================
+          SECTION 2: USE-CASE MARQUEE (ZERO EMOJIS, CLEAN SVG ICONS)
+          ========================================================= */}
+      <section className="relative w-full border-y border-white/[0.06] bg-zinc-950/60 py-3 sm:py-4 overflow-hidden">
+        {/* Gradient edge masks */}
+        <div className="absolute left-0 top-0 bottom-0 w-10 sm:w-24 bg-gradient-to-r from-black to-transparent z-10 pointer-events-none" />
+        <div className="absolute right-0 top-0 bottom-0 w-10 sm:w-24 bg-gradient-to-l from-black to-transparent z-10 pointer-events-none" />
 
-        {status === 'done' && (
-          <TranscriptWorkspace
-            rawTranscript={rawTranscript}
-            polishedTranscript={polishedTranscript}
-            onReset={handleReset}
-          />
-        )}
-      </div>
-    </main>
+        <div className="animate-marquee flex gap-3 sm:gap-4">
+          {[...marqueeItems, ...marqueeItems].map((item, idx) => (
+            <div
+              key={idx}
+              className="flex items-center gap-2.5 sm:gap-3 px-3.5 sm:px-5 py-2 sm:py-2.5 rounded-full border border-white/[0.08] bg-black/80 backdrop-blur-sm text-left whitespace-nowrap shadow-sm hover:border-[#00D4B4]/40 transition"
+            >
+              <div className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-[#00D4B4]/15 text-[#00D4B4] flex items-center justify-center shrink-0">
+                <Mic className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
+              </div>
+              <div>
+                <div className="text-[11px] sm:text-xs font-semibold text-white flex items-center gap-1.5">
+                  <span>{item.title}</span>
+                  <span className="text-[9px] sm:text-[10px] font-mono text-zinc-400">({item.duration})</span>
+                </div>
+                <div className="text-[10px] sm:text-[11px] text-[#00D4B4] font-medium flex items-center gap-1">
+                  <ArrowRight className="w-2.5 h-2.5 text-[#00D4B4]" />
+                  <span>{item.output}</span>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* =========================================================
+          SECTION 3: CORE BENEFITS & BENTO FEATURES
+          ========================================================= */}
+      <main id="features" className="max-w-7xl mx-auto px-4 sm:px-6 py-14 sm:py-24 flex flex-col items-center text-center z-10 w-full">
+        
+        {/* Section Header */}
+        <div className="max-w-xl mx-auto mb-10 text-center">
+
+          <h2 className="text-2xl sm:text-3xl font-bold tracking-tight text-white">
+            Everything you need. Nothing you don't.
+          </h2>
+          <p className="mt-2 text-xs sm:text-sm text-zinc-400">
+            From raw audio recordings to publication-ready summaries in single seconds.
+          </p>
+        </div>
+
+        {/* Benefits Strip - Mobile 2x2 Grid with Clean Borders */}
+        <div className="grid grid-cols-2 md:grid-cols-4 max-w-4xl w-full border border-white/[0.08] rounded-2xl bg-zinc-950/70 backdrop-blur-sm overflow-hidden text-left shadow-lg">
+          <div className="p-4 sm:p-5 border-r border-b md:border-b-0 border-white/[0.06] flex flex-col justify-between">
+            <div className="flex items-center justify-between text-zinc-500 mb-2">
+              <Clock className="w-4 h-4 text-[#00D4B4]" />
+              <span className="text-[10px] font-mono text-zinc-400">SPEED</span>
+            </div>
+            <div className="text-xl sm:text-2xl font-bold text-white tracking-tight">&lt; 5s</div>
+            <div className="text-[11px] sm:text-xs text-zinc-400 mt-1">Instant Turnaround</div>
+          </div>
+
+          <div className="p-4 sm:p-5 border-b md:border-b-0 md:border-r border-white/[0.06] flex flex-col justify-between">
+            <div className="flex items-center justify-between text-zinc-500 mb-2">
+              <FileAudio className="w-4 h-4 text-emerald-400" />
+              <span className="text-[10px] font-mono text-zinc-400">INPUT</span>
+            </div>
+            <div className="text-xl sm:text-2xl font-bold text-[#00D4B4] tracking-tight">Any File</div>
+            <div className="text-[11px] sm:text-xs text-zinc-400 mt-1">Audio or Video</div>
+          </div>
+
+          <div className="p-4 sm:p-5 border-r border-white/[0.06] flex flex-col justify-between">
+            <div className="flex items-center justify-between text-zinc-500 mb-2">
+              <CheckCircle2 className="w-4 h-4 text-white" />
+              <span className="text-[10px] font-mono text-zinc-400">ACCURACY</span>
+            </div>
+            <div className="text-xl sm:text-2xl font-bold text-white tracking-tight">99%+</div>
+            <div className="text-[11px] sm:text-xs text-zinc-400 mt-1">Global Accents</div>
+          </div>
+
+          <div className="p-4 sm:p-5 flex flex-col justify-between">
+            <div className="flex items-center justify-between text-zinc-500 mb-2">
+              <Download className="w-4 h-4 text-purple-400" />
+              <span className="text-[10px] font-mono text-zinc-400">EXPORT</span>
+            </div>
+            <div className="text-xl sm:text-2xl font-bold text-white tracking-tight">1-Click</div>
+            <div className="text-[11px] sm:text-xs text-zinc-400 mt-1">PDF & Word Export</div>
+          </div>
+        </div>
+
+        {/* 4 Stacked Alternating Feature Rows */}
+        <div className="w-full max-w-6xl mt-12 sm:mt-16 divide-y divide-white/[0.06]">
+          
+          {/* Row 1: Exact Transcripts (Text Left / Icon Right) */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-10 lg:gap-16 items-center w-full py-16 md:py-24 text-left">
+            {/* Content Column */}
+            <div className="order-2 lg:order-1 flex flex-col items-start space-y-4 max-w-xl">
+              <span className="inline-block rounded-full border border-border bg-muted px-3 py-1 text-xs font-medium tracking-wide text-muted-foreground uppercase font-mono">
+                LIVE NOW
+              </span>
+              <h3 className="text-3xl md:text-4xl font-bold text-foreground tracking-tight">
+                Exact Transcripts with Speaker Names
+              </h3>
+              <p className="text-muted-foreground text-base md:text-lg leading-relaxed max-w-md">
+                Never re-listen to an hour-long recording just to find one sentence. Search the full text instantly, jump to specific speaker moments, or export cleanly formatted PDFs and Word documents.
+              </p>
+
+              {/* Supplementary Demo: 3 Mini Cards */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 sm:gap-3 pt-3 w-full">
+                <div className="p-3.5 rounded-xl border border-white/[0.06] bg-zinc-950/60 backdrop-blur-sm">
+                  <div className="text-xs font-semibold text-white mb-1">Speaker Separation</div>
+                  <div className="text-[11px] text-zinc-400 leading-relaxed">Automatically detects who is speaking throughout the conversation.</div>
+                </div>
+                <div className="p-3.5 rounded-xl border border-white/[0.06] bg-zinc-950/60 backdrop-blur-sm">
+                  <div className="text-xs font-semibold text-white mb-1">Exact Timestamps</div>
+                  <div className="text-[11px] text-zinc-400 leading-relaxed">Click any sentence to jump directly to that moment in the audio.</div>
+                </div>
+                <div className="p-3.5 rounded-xl border border-white/[0.06] bg-zinc-950/60 backdrop-blur-sm">
+                  <div className="text-xs font-semibold text-white mb-1">PDF & Word Export</div>
+                  <div className="text-[11px] text-zinc-400 leading-relaxed">Download formatted reports ready to share with your clients or team.</div>
+                </div>
+              </div>
+            </div>
+
+            {/* Icon Column */}
+            <div className="order-1 lg:order-2 flex items-center justify-center relative w-full py-4 lg:py-0">
+              <div className="absolute w-64 h-64 sm:w-80 sm:h-80 rounded-full bg-[var(--accent-glow)] blur-3xl opacity-35 pointer-events-none" />
+              <div className="relative z-10 max-w-xs md:max-w-sm w-full flex items-center justify-center">
+                <Image
+                  src="/3d-icon/exact-transcripts-with-speaker-names.png"
+                  alt="3D icon representing exact transcripts with speaker names"
+                  width={2548}
+                  height={2548}
+                  priority
+                  className="w-full h-auto object-contain drop-shadow-[0_20px_50px_rgba(0,0,0,0.6)] transform hover:scale-105 transition-transform duration-500 select-none"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Row 2: No Slow Video Uploads (Icon Left / Text Right) */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-10 lg:gap-16 items-center w-full py-16 md:py-24 text-left">
+            {/* Content Column */}
+            <div className="order-2 lg:order-2 flex flex-col items-start space-y-4 max-w-xl">
+              <span className="inline-block rounded-full border border-border bg-muted px-3 py-1 text-xs font-medium tracking-wide text-muted-foreground uppercase font-mono">
+                ZERO WAITING
+              </span>
+              <h3 className="text-3xl md:text-4xl font-bold text-foreground tracking-tight">
+                No Slow Video Uploads
+              </h3>
+              <p className="text-muted-foreground text-base md:text-lg leading-relaxed max-w-md">
+                Have a huge 2GB video? Sonic AI extracts the audio right on your device in under a second so you don't spend all day staring at an upload bar.
+              </p>
+
+              {/* Supplementary Demo: Instant Extraction Preview */}
+              <div className="w-full max-w-md pt-2 space-y-3">
+                <div className="rounded-xl border border-white/[0.08] bg-black/60 p-4">
+                  <div className="flex items-center justify-between text-xs mb-1.5">
+                    <span className="text-zinc-300 font-medium truncate max-w-[180px]">team_interview.mp4</span>
+                    <span className="text-emerald-400 font-mono text-xs font-semibold">Instant 0.4s</span>
+                  </div>
+                  <div className="text-xs text-zinc-400 leading-relaxed">
+                    Only the lightweight audio is sent to transcribe. 100% private and 50x faster.
+                  </div>
+                </div>
+                <div className="text-xs text-zinc-400 flex items-center gap-2 pt-0.5">
+                  <CheckCircle2 className="w-4 h-4 text-[#00D4B4] shrink-0" />
+                  <span>Works directly on your phone or laptop.</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Icon Column */}
+            <div className="order-1 lg:order-1 flex items-center justify-center relative w-full py-4 lg:py-0">
+              <div className="absolute w-64 h-64 sm:w-80 sm:h-80 rounded-full bg-[var(--accent-glow)] blur-3xl opacity-35 pointer-events-none" />
+              <div className="relative z-10 max-w-xs md:max-w-sm w-full flex items-center justify-center">
+                <Image
+                  src="/3d-icon/no-slow-video-uploads.png"
+                  alt="3D icon representing fast on-device video extraction"
+                  width={2548}
+                  height={2548}
+                  className="w-full h-auto object-contain drop-shadow-[0_20px_50px_rgba(0,0,0,0.6)] transform hover:scale-105 transition-transform duration-500 select-none"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Row 3: Instant Summaries & Social Posts (Text Left / Icon Right) */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-10 lg:gap-16 items-center w-full py-16 md:py-24 text-left">
+            {/* Content Column */}
+            <div className="order-2 lg:order-1 flex flex-col items-start space-y-4 max-w-xl">
+              <span className="inline-block rounded-full border border-border bg-muted px-3 py-1 text-xs font-medium tracking-wide text-muted-foreground uppercase font-mono">
+                1-CLICK MAGIC
+              </span>
+              <h3 className="text-3xl md:text-4xl font-bold text-foreground tracking-tight">
+                Instant Summaries & Social Posts
+              </h3>
+              <p className="text-muted-foreground text-base md:text-lg leading-relaxed max-w-md">
+                Professional writing with zero artificial AI emojis. Turn your discussions into concise executive summaries, actionable bullet points, or viral social posts with a single click.
+              </p>
+
+              {/* Supplementary Demo: Interactive Tabs */}
+              <div className="w-full max-w-xl pt-2">
+                <div className="rounded-xl border border-white/[0.08] bg-black/60 p-3 sm:p-4">
+                  <div className="flex items-center justify-between gap-2 pb-3 border-b border-white/[0.06] mb-3">
+                    <div className="flex items-center gap-1 overflow-x-auto no-scrollbar py-0.5">
+                      {(["summary", "linkedin", "x"] as const).map((tab) => (
+                        <button
+                          key={tab}
+                          onClick={() => setActiveTab(tab)}
+                          className={`px-2.5 py-1 text-[11px] sm:text-xs rounded-lg font-medium transition whitespace-nowrap ${
+                            activeTab === tab
+                              ? "bg-[#00D4B4] text-[#0D0D0D] font-bold shadow-sm"
+                              : "text-zinc-400 hover:text-white hover:bg-white/5"
+                          }`}
+                        >
+                          {tab === "summary" ? "Summary" : tab === "linkedin" ? "LinkedIn Post" : "Twitter Thread"}
+                        </button>
+                      ))}
+                    </div>
+
+                    <button
+                      onClick={() => handleCopy(activeTab, copySamples[activeTab])}
+                      className="flex items-center gap-1 text-[11px] font-medium text-zinc-400 hover:text-white px-2.5 py-1 rounded border border-white/10 hover:bg-white/5 transition shrink-0 active:scale-95"
+                    >
+                      {copiedTab === activeTab ? (
+                        <>
+                          <Check className="w-3 h-3 text-[#00D4B4]" />
+                          <span className="text-[#00D4B4]">Copied!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3 h-3" />
+                          <span className="hidden xs:inline">Copy Text</span>
+                          <span className="xs:hidden">Copy</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  <p className="text-xs text-zinc-300 leading-relaxed whitespace-pre-line font-sans max-h-48 overflow-y-auto pr-1">
+                    {copySamples[activeTab]}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Icon Column */}
+            <div className="order-1 lg:order-2 flex items-center justify-center relative w-full py-4 lg:py-0">
+              <div className="absolute w-64 h-64 sm:w-80 sm:h-80 rounded-full bg-[var(--accent-glow)] blur-3xl opacity-35 pointer-events-none" />
+              <div className="relative z-10 max-w-xs md:max-w-sm w-full flex items-center justify-center">
+                <Image
+                  src="/3d-icon/instant-summaries-and-social-posts.png"
+                  alt="3D icon representing instant summaries and social posts"
+                  width={2548}
+                  height={2548}
+                  className="w-full h-auto object-contain drop-shadow-[0_20px_50px_rgba(0,0,0,0.6)] transform hover:scale-105 transition-transform duration-500 select-none"
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* Row 4: Shorts & Video Clips (Icon Left / Text Right) */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-10 lg:gap-16 items-center w-full py-16 md:py-24 text-left">
+            {/* Content Column */}
+            <div className="order-2 lg:order-2 flex flex-col items-start space-y-4 max-w-xl">
+              <span className="inline-block rounded-full border border-border bg-muted px-3 py-1 text-xs font-medium tracking-wide text-muted-foreground uppercase font-mono">
+                ROADMAP
+              </span>
+              <h3 className="text-3xl md:text-4xl font-bold text-foreground tracking-tight">
+                Shorts & Video Clips
+              </h3>
+              <p className="text-muted-foreground text-base md:text-lg leading-relaxed max-w-md">
+                Coming soon: Turn long video recordings into vertical 9:16 short clips with animated subtitles for social media.
+              </p>
+
+              {/* Supplementary Demo: Active Development Callout */}
+              <div className="w-full max-w-md pt-2 space-y-3">
+                <div className="rounded-xl border border-white/[0.08] bg-black/60 p-4 text-left">
+                  <div className="text-xs text-amber-300 font-semibold mb-1">Under Active Development</div>
+                  <p className="text-xs text-zinc-400 leading-relaxed">
+                    Preview locked studio tabs inside your project workspace.
+                  </p>
+                </div>
+
+                <Link
+                  href="/projects"
+                  className="inline-flex items-center gap-2 text-xs sm:text-sm font-medium text-zinc-400 hover:text-white transition group pt-1"
+                >
+                  <span>Explore Workspace</span>
+                  <ArrowRight className="w-3.5 h-3.5 group-hover:translate-x-1 transition-transform" />
+                </Link>
+              </div>
+            </div>
+
+            {/* Icon Column */}
+            <div className="order-1 lg:order-1 flex items-center justify-center relative w-full py-4 lg:py-0">
+              <div className="absolute w-64 h-64 sm:w-80 sm:h-80 rounded-full bg-[var(--accent-glow)] blur-3xl opacity-35 pointer-events-none" />
+              <div className="relative z-10 max-w-xs md:max-w-sm w-full flex items-center justify-center">
+                <Image
+                  src="/3d-icon/shorts-and-video-clips.png"
+                  alt="3D icon representing shorts and video clips"
+                  width={2548}
+                  height={2548}
+                  className="w-full h-auto object-contain drop-shadow-[0_20px_50px_rgba(0,0,0,0.6)] transform hover:scale-105 transition-transform duration-500 select-none"
+                />
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        {/* Bottom CTA Card - Mobile Optimized */}
+        <div className="mt-14 sm:mt-24 max-w-4xl w-full rounded-2xl sm:rounded-3xl border border-[#00D4B4]/30 bg-gradient-to-b from-[#00D4B4]/10 to-zinc-950 p-6 sm:p-12 text-center relative overflow-hidden shadow-2xl">
+          <h2 className="text-xl sm:text-2xl md:text-3xl font-bold text-white tracking-tight">
+            Ready to get hours back in your week?
+          </h2>
+          <p className="mt-2.5 sm:mt-3 text-xs sm:text-sm text-zinc-300 max-w-lg mx-auto leading-relaxed">
+            Try Sonic AI for free. Drop your first voice memo or meeting recording and get clean text in 5 seconds.
+          </p>
+          <div className="mt-6 sm:mt-7 flex justify-center w-full px-2 sm:px-0">
+            <Link
+              href="/register"
+              className="w-full sm:w-auto px-8 py-3.5 sm:py-4 bg-[#00D4B4] hover:bg-[#00D4B4]/90 text-[#0D0D0D] font-bold rounded-full transition shadow-lg shadow-[#00D4B4]/30 text-sm sm:text-base flex items-center justify-center gap-2 active:scale-95"
+            >
+              Get Started Free <ArrowRight className="w-4 h-4" />
+            </Link>
+          </div>
+        </div>
+      </main>
+
+      {/* Footer - Mobile Friendly Layout */}
+      <footer className="border-t border-white/[0.08] py-8 sm:py-10 px-4 sm:px-6 z-10 bg-black/40">
+        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-zinc-500 text-center sm:text-left">
+          <div className="flex items-center gap-2">
+            <div className="w-5 h-5 rounded-md bg-[#00D4B4] flex items-center justify-center text-[#0D0D0D] font-bold text-[10px]">
+              S
+            </div>
+            <span className="text-zinc-300 font-medium">Sonic AI Studio</span>
+            <span className="hidden sm:inline">•</span>
+            <span className="hidden sm:inline">Turn voice into actionable content in seconds.</span>
+          </div>
+
+          <div className="flex items-center gap-5 sm:gap-6 py-1">
+            <Link href="/projects" className="py-1 px-1 hover:text-zinc-300 transition">Projects</Link>
+            <Link href="/pricing" className="py-1 px-1 hover:text-zinc-300 transition">Pricing</Link>
+            <Link href="/login" className="py-1 px-1 hover:text-zinc-300 transition">Sign In</Link>
+          </div>
+        </div>
+      </footer>
+    </div>
   );
 }
