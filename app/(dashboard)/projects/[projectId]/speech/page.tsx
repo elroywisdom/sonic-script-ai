@@ -35,7 +35,7 @@ import {
   RotateCcw,
   Pencil
 } from "lucide-react";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, apiUpload } from "@/lib/api";
 import { extractAudioChunks } from "@/lib/extractAudio";
 import { exportAsMarkdown, exportAsDoc, exportAsPdf, exportAsTxt, downloadFile } from "@/lib/exportTranscript";
 
@@ -335,16 +335,7 @@ export default function SpeechStudioPage() {
         const formData = new FormData();
         formData.append('file', chunk.blob, chunk.filename);
 
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080/api/v1';
-        const res = await fetch(`${apiUrl}/projects/${projectId}/transcribe`, {
-          method: 'POST',
-          headers: {
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-          body: formData,
-        });
-
-        const data = await res.json();
+        const data = await apiUpload<any>(`/projects/${projectId}/transcribe`, formData);
 
         if (data.success && data.data) {
           combinedTranscript += (combinedTranscript ? ' ' : '') + data.data.full_text;
